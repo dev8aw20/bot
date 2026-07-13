@@ -8,15 +8,16 @@ STATUS: this is the converted pattern, not a full mechanical port of all
 dict, /start (including batch_ deep-link delivery), the FULL /folders
 group, the FULL audio-ingestion + page-rendering group, the FULL
 delivery path (force-join gate, _deliver_batch, cancel-send, "UPDATE
-CHANNEL" button via the shared UPDATE_CHANNEL_URL env var), and the FULL
+CHANNEL" button via the shared UPDATE_CHANNEL_URL env var), the FULL
 /forcejoin management group (add/remove/edit-link, chat-join-request
-recording, capped at FORCE_JOIN_LIMIT channels per clone). All gated on
-self.owner_id, i.e. THIS clone's own owner, not the master bot's admin.
+recording, capped at FORCE_JOIN_LIMIT channels per clone), and
+auto-delete (job_delete_expired, run every 60s via job_queue — reads
+clone_settings.auto_delete_enabled/minutes/message instead of a hardcoded
+constant, and actually deletes the messages logged in sent_logs, which
+previously never happened). All gated on self.owner_id, i.e. THIS clone's
+own owner, not the master bot's admin.
 
 STILL NOT PORTED, so don't be surprised by these:
-  - auto_delete_job: sent_logs rows get written with a delete_at
-    timestamp, and the delivery message PROMISES files will be deleted
-    after N minutes, but no scheduled job actually deletes them yet.
   - broadcast, episode search (non-owner text fallthrough), /refreshbuttons.
 
 Porting each of those is the same mechanical transform repeated per
@@ -57,8 +58,10 @@ logger = logging.getLogger(__name__)
 
 BATCH_MAX = 50
 PAGE_SIZE = 20  # max inline buttons per channel message
-DELETE_MINUTES = 5  # matches bot.py's default; see note on auto_delete_job below
 FORCE_JOIN_LIMIT = 6  # cap on how many channels a clone owner can force-join to
+DEFAULT_AUTO_DELETE_MSG = (
+    "\u26a0\ufe0f These files will self-destruct in {minutes} minutes."
+)  # kept in sync with clone_features.py's copy — shown when the owner hasn't set a custom one
 
 # Same env var bot.py uses for the master's "UPDATE CHANNEL" button — shared
 # across master + every clone rather than a per-clone setting, since nothing
@@ -272,12 +275,12 @@ class BotInstance:
         await self._continue_after_gates(update, ctx, settings, args)
 
     # ── Batch delivery (converted from _deliver_batch / cb_cancel_send).
-    # NOTE: the "FILES WILL BE DELETED AFTER N minutes" message below is a
-    # PROMISE, not an action — bot.py's auto_delete_job (the scheduled task
-    # that actually deletes the messages logged in sent_logs) is NOT ported
-    # here yet. sent_logs rows get written with a delete_at timestamp, but
-    # nothing currently reads them and performs the deletion. Don't rely on
-    # auto-delete actually happening until that job is ported too. ───────
+    # Auto-delete is now real: if clone_settings.auto_delete_enabled is
+    # True, the closing message's deletion line uses the configured
+    # minutes/custom message, sent_logs gets a row, and job_delete_expired
+    # (registered in build_application) sweeps and deletes it on schedule.
+    # If disabled, no deletion warning is shown and no sent_logs row is
+    # written at all. ─────────────────────────────────────────────────────
     async def _deliver_batch(self, batch_id: int, chat_id: int, user_id_int: int, ctx: ContextTypes.DEFAULT_TYPE):
         user_id = str(user_id_int)
 
@@ -285,6 +288,23 @@ class BotInstance:
         if not batch:
             await ctx.bot.send_message(chat_id=chat_id, text="\u274c This collection does not exist.")
             return
+
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        auto_delete_on = settings["auto_delete_enabled"]
+        auto_delete_minutes = settings["auto_delete_minutes"]
+
+        def _closing_text():
+            hands = " ".join(["\U0001F590\ufe0f"] * 8)
+            if auto_delete_on:
+                warning = settings["auto_delete_message"] or DEFAULT_AUTO_DELETE_MSG
+                try:
+                    warning = warning.format(minutes=auto_delete_minutes)
+                except (KeyError, IndexError):
+                    pass  # bad {placeholder} in a saved custom message — show as-is
+                body = f"\U0001F4C1 {warning}\nTO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+            else:
+                body = "TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+            return f"\u2764\ufe0f HEY BRO \u2b07\ufe0f\n\n{body}{hands}"
 
         wait_rows = [[InlineKeyboardButton("\u2022 Cancel", callback_data=f"cancelsend_{batch_id}")]]
         if UPDATE_CHANNEL_URL:
@@ -348,7 +368,6 @@ class BotInstance:
 
         if was_cancelled:
             if sent_audio_count > 0:
-                hands = " ".join(["\U0001F590\ufe0f"] * 8)
                 closing_rows = None
                 if UPDATE_CHANNEL_URL:
                     closing_rows = InlineKeyboardMarkup(
@@ -356,14 +375,7 @@ class BotInstance:
                     )
                 closing = await ctx.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"\u2764\ufe0f HEY BRO \u2b07\ufe0f\n\n"
-                        f"\U0001F4C1 FILES WILL BE DELETED AFTER "
-                        f"[{DELETE_MINUTES} minutes] "
-                        f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
-                        f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
-                        f"{hands}"
-                    ),
+                    text=_closing_text(),
                     reply_markup=closing_rows,
                 )
                 sent_ids.append(closing.message_id)
@@ -382,7 +394,6 @@ class BotInstance:
                 )
 
             if sent_audio_count > 0:
-                hands = " ".join(["\U0001F590\ufe0f"] * 8)
                 closing_rows = None
                 if UPDATE_CHANNEL_URL:
                     closing_rows = InlineKeyboardMarkup(
@@ -390,13 +401,7 @@ class BotInstance:
                     )
                 closing = await ctx.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"\u2764\ufe0f HEY BRO \u2b07\ufe0f\n\n"
-                        f"\U0001F4C1 FILES WILL BE DELETED AFTER [{DELETE_MINUTES} minutes] "
-                        f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
-                        f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
-                        f"{hands}"
-                    ),
+                    text=_closing_text(),
                     reply_markup=closing_rows,
                 )
                 sent_ids.append(closing.message_id)
@@ -404,11 +409,35 @@ class BotInstance:
         if not sent_ids:
             return
 
-        delete_at = datetime.utcnow() + timedelta(minutes=DELETE_MINUTES)
-        await self.db.execute(
-            "INSERT INTO sent_logs (user_id, batch_id, message_ids, delete_at) VALUES ($1,$2,$3,$4)",
-            user_id, batch_id, json.dumps(sent_ids), delete_at
+        if auto_delete_on:
+            delete_at = datetime.utcnow() + timedelta(minutes=auto_delete_minutes)
+            await self.db.execute(
+                "INSERT INTO sent_logs (user_id, batch_id, message_ids, delete_at) VALUES ($1,$2,$3,$4)",
+                user_id, batch_id, json.dumps(sent_ids), delete_at
+            )
+
+    async def job_delete_expired(self, ctx: ContextTypes.DEFAULT_TYPE):
+        """Registered in build_application() via job_queue.run_repeating.
+        This is the piece that was missing entirely (see module docstring)
+        — _deliver_batch wrote sent_logs rows and told the user files
+        would be deleted, but nothing ever read them and did it."""
+        rows = await self.db.fetch(
+            "SELECT id, user_id, message_ids FROM sent_logs WHERE delete_at <= NOW()"
         )
+        for row in rows:
+            chat_id = int(row["user_id"])  # private-chat delivery: chat_id == user_id
+            for message_id in json.loads(row["message_ids"]):
+                try:
+                    await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except Exception as e:
+                    # Already deleted, user blocked the bot, Telegram's 48h
+                    # delete window passed — none of these should leave the
+                    # row stuck so this job retries it forever.
+                    logger.debug(
+                        "Auto-delete: couldn't delete message %s in chat %s: %s",
+                        message_id, chat_id, e,
+                    )
+            await self.db.execute("DELETE FROM sent_logs WHERE id = $1", row["id"])
 
     async def cb_cancel_send(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Marks a batch delivery as cancelled. Checked once per audio,
@@ -1143,6 +1172,13 @@ class BotInstance:
         # private chat.
         app.add_handler(MessageHandler(filters.AUDIO & filters.ChatType.CHANNEL, self.handle_channel_audio))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_owner_text))
+
+        # Sweeps sent_logs for expired deliveries and actually deletes them —
+        # see job_delete_expired's docstring. Every 60s is a compromise: fine
+        # granularity for the "N minutes" promise without hammering the DB;
+        # first=15 so a just-started clone isn't silently idle for a full
+        # minute before its first sweep.
+        app.job_queue.run_repeating(self.job_delete_expired, interval=60, first=15)
         # ... remaining handlers from bot.py's main() go here, each bound
         # to `self` once ported per the checklist at the top of this file.
 
