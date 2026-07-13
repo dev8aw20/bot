@@ -1,0 +1,1164 @@
+"""
+Per-clone bot instance: every piece of state that is currently a module
+global in bot.py becomes `self.` here instead, so N clones can run in one
+process without stepping on each other's conversation state or DB pool.
+
+STATUS: this is the converted pattern, not a full mechanical port of all
+1600 lines of bot.py. Ported so far: construction, DB pool, owner-state
+dict, /start (including batch_ deep-link delivery), the FULL /folders
+group, the FULL audio-ingestion + page-rendering group, the FULL
+delivery path (force-join gate, _deliver_batch, cancel-send, "UPDATE
+CHANNEL" button via the shared UPDATE_CHANNEL_URL env var), and the FULL
+/forcejoin management group (add/remove/edit-link, chat-join-request
+recording, capped at FORCE_JOIN_LIMIT channels per clone). All gated on
+self.owner_id, i.e. THIS clone's own owner, not the master bot's admin.
+
+STILL NOT PORTED, so don't be surprised by these:
+  - auto_delete_job: sent_logs rows get written with a delete_at
+    timestamp, and the delivery message PROMISES files will be deleted
+    after N minutes, but no scheduled job actually deletes them yet.
+  - broadcast, episode search (non-owner text fallthrough), /refreshbuttons.
+
+Porting each of those is the same mechanical transform repeated per
+remaining group:
+
+    1. Move any `global X` variable referenced by the function into
+       __init__ as self.X.
+    2. Turn the free function into `async def name(self, update, ctx):`.
+    3. Replace bare `db.` calls with `self.db.`.
+    4. Replace bare `OWNER_ID` with `self.owner_id`, etc.
+    5. Register it in build_application() as
+       `app.add_handler(CommandHandler("x", self.cmd_x))`.
+
+I stopped here deliberately rather than machine-porting all 1584 lines
+blind — that volume of untested, mechanically-transformed code is exactly
+the kind of thing that looks done and isn't. Happy to do the rest in
+follow-up passes, function group by function group, so each can actually
+be checked.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ChatJoinRequestHandler, filters, ContextTypes,
+)
+from telegram.request import HTTPXRequest
+
+from db import Database
+
+logger = logging.getLogger(__name__)
+
+BATCH_MAX = 50
+PAGE_SIZE = 20  # max inline buttons per channel message
+DELETE_MINUTES = 5  # matches bot.py's default; see note on auto_delete_job below
+FORCE_JOIN_LIMIT = 6  # cap on how many channels a clone owner can force-join to
+
+# Same env var bot.py uses for the master's "UPDATE CHANNEL" button — shared
+# across master + every clone rather than a per-clone setting, since nothing
+# asked for per-clone customization here and clone_settings has no column
+# for it. If that changes, move this to clone_settings and read it per-row
+# in BotInstance.__init__ instead.
+UPDATE_CHANNEL_URL = os.environ.get("UPDATE_CHANNEL_URL", "").strip()
+
+EPISODE_EXTRACT_PATTERNS = [
+    re.compile(r'(?:episode|ep)\.?\s*#?\s*(\d+)', re.IGNORECASE),
+    re.compile(r'#\s*(\d+)'),
+    re.compile(r'(\d+)'),
+]
+
+
+class BotInstance:
+    def __init__(self, clone_row: dict, central_db: Database):
+        """
+        clone_row: decrypted row from central_db.get_clone() / list_all_active_clones()
+            {id, user_id, bot_token, supabase_url, supabase_key, bot_username, is_active, is_public}
+        central_db: connection to the CENTRAL Supabase (user_bots table),
+            used here only to record activity/errors back against this clone's row.
+        """
+        self.clone_id = clone_row["id"]
+        self.owner_id = int(clone_row["user_id"])
+        self.bot_token = clone_row["bot_token"]
+        self.bot_username = clone_row["bot_username"]
+        self.is_public = clone_row.get("is_public", True)
+        self.central_db = central_db
+
+        # Every clone MUST have its own Supabase — see db.create_clone's
+        # docstring for why a shared db is unsafe (no clone_id column
+        # anywhere in the schema). Fail loudly here rather than silently
+        # falling back to central_db, so a legacy row created before this
+        # was enforced surfaces as an obvious startup error, not silent
+        # data mixing with the master bot or other clones.
+        clone_db_url = clone_row.get("supabase_url")
+        if not clone_db_url:
+            raise ValueError(
+                f"Clone {clone_row.get('id')} (@{clone_row.get('bot_username')}) has no "
+                "supabase_url — refusing to start it against the shared central db. "
+                "This clone was likely created before per-clone databases were "
+                "required; give it its own Supabase project and update its row."
+            )
+        self.db = Database(clone_db_url)
+
+        # ── formerly module-level globals in bot.py, now per-instance ──
+        self.awaiting_new_folder_name: bool = False
+        self.awaiting_channel_id_for_folder: int | None = None
+        self.awaiting_source_channel_id_for_folder: int | None = None
+        self.new_folder_pending_source: bool = False
+        self.pending_broadcast_text: str | None = None
+        self.awaiting_force_join_step: str | None = None   # None | "id" | "link"
+        self.force_join_pending_channel_id: str | None = None
+        self.force_join_pending_title: str | None = None
+        self.awaiting_force_join_edit_channel_id: str | None = None
+        self.cancelled_deliveries: set[tuple[int, int]] = set()
+        # Per-folder asyncio.Lock so concurrent audio posts to the same
+        # source channel don't race on batch total_links/page rendering.
+        # Per-instance (not module-level like bot.py's) so two clones'
+        # folder id=1 don't share a lock.
+        self._folder_ingest_locks: dict[int, asyncio.Lock] = {}
+
+    def _reset_owner_state(self):
+        self.awaiting_new_folder_name = False
+        self.awaiting_channel_id_for_folder = None
+        self.awaiting_source_channel_id_for_folder = None
+        self.new_folder_pending_source = False
+        self.pending_broadcast_text = None
+        self.awaiting_force_join_step = None
+        self.force_join_pending_channel_id = None
+        self.force_join_pending_title = None
+        self.awaiting_force_join_edit_channel_id = None
+
+    # ── /start (converted from cmd_start in bot.py) ─────────────────────
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await self.central_db.touch_clone_activity(self.clone_id)
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        user = update.effective_user
+        args = ctx.args
+
+        await self.db.execute(
+            """INSERT INTO users (user_id) VALUES ($1)
+               ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW()""",
+            str(user.id)
+        )
+
+        if user.id == self.owner_id and (not args or not args[0].startswith("batch_")):
+            label = "the owner" if settings["hide_owner"] else f"owner of @{self.bot_username}"
+            await update.effective_message.reply_text(f"Welcome back, {label}.")
+            return
+
+        if not self.is_public and user.id != self.owner_id:
+            await update.effective_message.reply_text(
+                "This bot is private — only the owner can use it."
+            )
+            return
+
+        batch_id = int(args[0].replace("batch_", "")) if args and args[0].startswith("batch_") else None
+        if not await self._check_force_join(update, ctx, batch_id):
+            return
+
+        await self._continue_after_gates(update, ctx, settings, args)
+
+    async def _continue_after_gates(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, settings: dict, args: list):
+        """Whatever cmd_start does once the owner/private/force-join checks
+        are done — factored out so cb_checkjoin can resume here after the
+        user clears the force-join gate, instead of duplicating the
+        start_msg / batch-delivery branching. The force-join check itself
+        already ran (in cmd_start, or in cb_checkjoin before calling this)
+        — do NOT re-check here, or a re-verify inside cb_checkjoin loops."""
+        if not args or not args[0].startswith("batch_"):
+            text = settings["start_msg"] or (
+                "Send me a shared link to get your files, or ask the owner "
+                "of this bot for one."
+            )
+            await update.effective_message.reply_text(text)
+            return
+
+        batch_id = int(args[0].replace("batch_", ""))
+        await self._deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
+
+    # ── Force-join gate (converted from _has_join_request / _is_member /
+    # _check_force_join / cb_checkjoin). Reads force_join_channels, which
+    # the /forcejoin management group below now populates per-clone,
+    # capped at FORCE_JOIN_LIMIT rows. Still passes through if a clone
+    # owner hasn't added any channels yet. ───────────────────────────────
+    async def _has_join_request(self, channel_id: str, user_id: int) -> bool:
+        row = await self.db.fetchrow(
+            "SELECT 1 FROM join_requests WHERE channel_id = $1 AND user_id = $2",
+            channel_id, str(user_id)
+        )
+        return row is not None
+
+    async def _is_member(self, bot, channel_id: str, user_id: int) -> bool:
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if member.status not in ("left", "kicked"):
+                return True
+        except Exception as e:
+            logger.warning("get_chat_member failed for channel %s, user %s: %s", channel_id, user_id, e)
+        return await self._has_join_request(channel_id, user_id)
+
+    async def _check_force_join(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, batch_id: int | None) -> bool:
+        """Returns True if the user may proceed. Otherwise sends a join
+        prompt and returns False. This clone's owner always bypasses."""
+        user = update.effective_user
+        if user.id == self.owner_id:
+            return True
+
+        channels = await self.db.fetch(
+            "SELECT id, channel_id, invite_link, title FROM force_join_channels ORDER BY id"
+        )
+        if not channels:
+            return True
+
+        not_joined = [c for c in channels if not await self._is_member(ctx.bot, c["channel_id"], user.id)]
+        if not not_joined:
+            return True
+
+        recheck_data = f"checkjoin_{batch_id}" if batch_id is not None else "checkjoin_0"
+        await self._send_join_prompt(
+            update, ctx,
+            invite_links=[c["invite_link"] for c in not_joined],
+            recheck_data=recheck_data,
+            not_joined_alert="You have not joined all the channels yet.",
+        )
+        return False
+
+    async def _send_join_prompt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                 invite_links: list[str], recheck_data: str, not_joined_alert: str):
+        """Shared rendering for both the /forcejoin gate (possibly several
+        channels) and the force-sub gate (always exactly one channel) so
+        the two look and behave identically to the user — same button
+        style, same copy, same "Try Again" mechanics."""
+        rows = [
+            [InlineKeyboardButton(f"\U0001F517 Join Channel {i}", url=url)]
+            for i, url in enumerate(invite_links, start=1)
+        ]
+        rows.append([InlineKeyboardButton("\U0001F504 Try Again", callback_data=recheck_data)])
+
+        arrows = " ".join(["\u2b07\ufe0f"] * min(len(invite_links) * 3, 9))
+        text = (
+            f"\u2764\ufe0f HEY THERE \u2728\n\n"
+            f"\U0001F525 TO USE THIS BOT, YOU MUST\n"
+            f"JOIN ALL [{len(invite_links)}] CHANNELS.\n\n"
+            f"\U0001F447 JOIN ALL CHANNELS AND\n"
+            f"PRESS \"TRY AGAIN\".\n\n"
+            f"{arrows}\n\n"
+            f"\u26a0\ufe0f If a channel is private, you'll need to send a join request "
+            f"(no need to wait for approval — as soon as you've sent the "
+            f"request, press \"Try Again\")."
+        )
+        if update.callback_query:
+            await update.callback_query.answer(not_joined_alert, show_alert=True)
+            await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+    async def cb_checkjoin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        data = update.callback_query.data.replace("checkjoin_", "")
+        batch_id = int(data) if data != "0" else None
+
+        ok = await self._check_force_join(update, ctx, batch_id)
+        if not ok:
+            return
+
+        await update.callback_query.answer("\u2705 Verified!")
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        args = [f"batch_{batch_id}"] if batch_id is not None else []
+        await self._continue_after_gates(update, ctx, settings, args)
+
+    # ── Batch delivery (converted from _deliver_batch / cb_cancel_send).
+    # NOTE: the "FILES WILL BE DELETED AFTER N minutes" message below is a
+    # PROMISE, not an action — bot.py's auto_delete_job (the scheduled task
+    # that actually deletes the messages logged in sent_logs) is NOT ported
+    # here yet. sent_logs rows get written with a delete_at timestamp, but
+    # nothing currently reads them and performs the deletion. Don't rely on
+    # auto-delete actually happening until that job is ported too. ───────
+    async def _deliver_batch(self, batch_id: int, chat_id: int, user_id_int: int, ctx: ContextTypes.DEFAULT_TYPE):
+        user_id = str(user_id_int)
+
+        batch = await self.db.fetchrow("SELECT id, total_links FROM batches WHERE id = $1", batch_id)
+        if not batch:
+            await ctx.bot.send_message(chat_id=chat_id, text="\u274c This collection does not exist.")
+            return
+
+        wait_rows = [[InlineKeyboardButton("\u2022 Cancel", callback_data=f"cancelsend_{batch_id}")]]
+        if UPDATE_CHANNEL_URL:
+            wait_rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
+
+        warn = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="\u23f3 Please wait...",
+            reply_markup=InlineKeyboardMarkup(wait_rows)
+        )
+
+        audios = await self.db.fetch(
+            "SELECT id, telegram_file_id FROM audios WHERE batch_id = $1 ORDER BY id",
+            batch_id
+        )
+        sent_ids = []
+
+        failed_audios = []
+        uncached_missing = []
+        MAX_ATTEMPTS = 3
+        RETRY_DELAY = 3
+        cancel_key = (chat_id, batch_id)
+        was_cancelled = False
+        sent_audio_count = 0
+
+        for audio in audios:
+            if cancel_key in self.cancelled_deliveries:
+                was_cancelled = True
+                break
+
+            msg = None
+
+            if not audio["telegram_file_id"]:
+                uncached_missing.append(audio["id"])
+                failed_audios.append(audio["id"])
+                continue
+
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
+                    break
+                except Exception as e:
+                    logger.error(
+                        "Audio %s attempt %s/%s — SEND failed: %s",
+                        audio["id"], attempt, MAX_ATTEMPTS, e,
+                    )
+                    if attempt < MAX_ATTEMPTS:
+                        await asyncio.sleep(RETRY_DELAY)
+
+            if msg is not None:
+                sent_ids.append(msg.message_id)
+                sent_audio_count += 1
+            else:
+                failed_audios.append(audio["id"])
+
+        self.cancelled_deliveries.discard(cancel_key)
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=warn.message_id)
+        except Exception as e:
+            logger.warning("Could not remove please-wait message for batch %s: %s", batch_id, e)
+
+        if was_cancelled:
+            if sent_audio_count > 0:
+                hands = " ".join(["\U0001F590\ufe0f"] * 8)
+                closing_rows = None
+                if UPDATE_CHANNEL_URL:
+                    closing_rows = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)]]
+                    )
+                closing = await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u2764\ufe0f HEY BRO \u2b07\ufe0f\n\n"
+                        f"\U0001F4C1 FILES WILL BE DELETED AFTER "
+                        f"[{DELETE_MINUTES} minutes] "
+                        f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
+                        f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+                        f"{hands}"
+                    ),
+                    reply_markup=closing_rows,
+                )
+                sent_ids.append(closing.message_id)
+        else:
+            if uncached_missing:
+                await ctx.bot.send_message(chat_id=chat_id, text="\u26a0\ufe0f This audio is not available right now.")
+
+            other_failures = len(failed_audios) - len(uncached_missing)
+            if other_failures > 0:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u26a0\ufe0f Failed to send {other_failures}/{len(audios)} audio files "
+                        f"(even after {MAX_ATTEMPTS} attempts). Please try /start again."
+                    )
+                )
+
+            if sent_audio_count > 0:
+                hands = " ".join(["\U0001F590\ufe0f"] * 8)
+                closing_rows = None
+                if UPDATE_CHANNEL_URL:
+                    closing_rows = InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)]]
+                    )
+                closing = await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u2764\ufe0f HEY BRO \u2b07\ufe0f\n\n"
+                        f"\U0001F4C1 FILES WILL BE DELETED AFTER [{DELETE_MINUTES} minutes] "
+                        f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
+                        f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+                        f"{hands}"
+                    ),
+                    reply_markup=closing_rows,
+                )
+                sent_ids.append(closing.message_id)
+
+        if not sent_ids:
+            return
+
+        delete_at = datetime.utcnow() + timedelta(minutes=DELETE_MINUTES)
+        await self.db.execute(
+            "INSERT INTO sent_logs (user_id, batch_id, message_ids, delete_at) VALUES ($1,$2,$3,$4)",
+            user_id, batch_id, json.dumps(sent_ids), delete_at
+        )
+
+    async def cb_cancel_send(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Marks a batch delivery as cancelled. Checked once per audio,
+        between sends — doesn't abort an upload already in progress."""
+        batch_id = int(update.callback_query.data.replace("cancelsend_", ""))
+        self.cancelled_deliveries.add((update.effective_chat.id, batch_id))
+        await update.callback_query.answer("Cancelling after the current file finishes...")
+
+    # ── /forcejoin management group (converted from bot.py's cmd_forcejoin
+    # and everything it fans out to). Gated on self.owner_id. The gate that
+    # ENFORCES these channels (_check_force_join above) already existed and
+    # reads force_join_channels from this clone's own db — this group is
+    # what actually lets the owner populate that table, capped at
+    # FORCE_JOIN_LIMIT channels so one clone owner can't force-sub users to
+    # an unbounded channel list. ─────────────────────────────────────────
+    async def cmd_forcejoin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        await self._show_force_join_management(update, ctx)
+
+    async def _show_force_join_management(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        channels = await self.db.fetch("SELECT id, title, channel_id FROM force_join_channels ORDER BY id")
+        rows = [
+            [
+                InlineKeyboardButton(f"\u274c {c['title'] or c['channel_id']}", callback_data=f"forcejoin_remove_{c['id']}"),
+                InlineKeyboardButton("\u270f\ufe0f Edit Link", callback_data=f"forcejoin_editlink_{c['id']}"),
+            ]
+            for c in channels
+        ]
+        if len(channels) < FORCE_JOIN_LIMIT:
+            rows.append([InlineKeyboardButton("\u2795 Add Channel/Group", callback_data="forcejoin_add")])
+
+        if channels:
+            text = (
+                f"\U0001F512 *Force Join Channels* ({len(channels)}/{FORCE_JOIN_LIMIT})\n\n"
+                "Tap to remove, or add a new one:"
+            )
+        else:
+            text = f"\U0001F512 No force-join channel set yet (0/{FORCE_JOIN_LIMIT}).\n\n\u2795 Start with Add Channel/Group."
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+            )
+
+    async def cb_forcejoin_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        await self._show_force_join_management(update, ctx)
+
+    async def cb_forcejoin_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        count = await self.db.fetchval("SELECT COUNT(*) FROM force_join_channels")
+        if count >= FORCE_JOIN_LIMIT:
+            await update.callback_query.answer(
+                f"\u26a0\ufe0f Limit reached — max {FORCE_JOIN_LIMIT} force-join channels. "
+                "Remove one before adding another.",
+                show_alert=True,
+            )
+            return
+        self._reset_owner_state()
+        self.awaiting_force_join_step = "id"
+        await update.callback_query.edit_message_text(
+            "\U0001F4E1 Send the Channel/Group ID or @username (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
+            "\u26a0\ufe0f The bot must be made an admin there (to see members, and to receive join "
+            "requests — the bot will NOT approve them, only record them)."
+        )
+
+    async def cb_forcejoin_remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        row_id = int(update.callback_query.data.replace("forcejoin_remove_", ""))
+        await self.db.execute("DELETE FROM force_join_channels WHERE id = $1", row_id)
+        await self._show_force_join_management(update, ctx)
+
+    async def cb_forcejoin_editlink(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        self._reset_owner_state()
+        row_id = int(update.callback_query.data.replace("forcejoin_editlink_", ""))
+        row = await self.db.fetchrow(
+            "SELECT id, channel_id, title FROM force_join_channels WHERE id = $1", row_id
+        )
+        if not row:
+            await update.callback_query.answer("\u26a0\ufe0f Channel not found (it may already have been removed).", show_alert=True)
+            await self._show_force_join_management(update, ctx)
+            return
+        self.awaiting_force_join_edit_channel_id = row["channel_id"]
+        await update.callback_query.edit_message_text(
+            f"\U0001F517 Send a new invite link for \"{row['title'] or row['channel_id']}\".\n\n"
+            "\u26a0\ufe0f If the link is expiring or showing 'invalid', keep both the expiry date "
+            "and member limit OFF/blank when creating a new link in Telegram — otherwise "
+            "it will go invalid again after some time/uses."
+        )
+
+    async def cb_chat_join_request(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Records join requests for THIS clone, for whatever chat sent
+        one — no longer gated on the chat being a registered
+        force_join_channels row, because force_sub's channel (a single ID
+        in clone_settings, not that table) needs the same recording now
+        that _check_force_sub falls back to _has_join_request too. A
+        recorded request for a channel nobody is gating on is harmless
+        (never read), so it's simpler and less fragile than resolving and
+        matching both channel_id formats (username vs numeric) here just
+        to decide whether to store it. Does NOT approve requests —
+        approval is left to the clone owner (manually, in Telegram)."""
+        req = update.chat_join_request
+        chat_id_str = str(req.chat.id)
+        try:
+            await self.db.execute(
+                """INSERT INTO join_requests (channel_id, user_id)
+                   VALUES ($1, $2)
+                   ON CONFLICT (channel_id, user_id) DO NOTHING""",
+                chat_id_str, str(req.from_user.id)
+            )
+        except Exception as e:
+            logger.warning("Failed to record join request for clone %s, chat %s, user %s: %s",
+                            self.clone_id, chat_id_str, req.from_user.id, e)
+
+    # ── /folders group (converted from bot.py's cmd_folders and everything
+    # it fans out to: detail view, output/source channel setting with live
+    # Telegram verification, and the text-wizard those trigger). All of it
+    # is gated on self.owner_id, which is THIS clone's owner (from
+    # clone_row["user_id"]), not the master bot's admin — so each clone
+    # owner already gets independent access to their own folders, they
+    # were just missing everything past folder creation. ────────────────
+    async def cmd_folders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        await self._show_folder_management(update, ctx)
+
+    async def _show_folder_management(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        folders = await self.db.fetch(
+            "SELECT id, name, channel_id, source_channel_id FROM folders ORDER BY name"
+        )
+        rows = []
+        for f in folders:
+            missing = []
+            if not f["channel_id"]:
+                missing.append("no output channel")
+            if not f["source_channel_id"]:
+                missing.append("no source channel")
+            label = f["name"] if not missing else f"{f['name']} (\u26a0\ufe0f {', '.join(missing)})"
+            rows.append([InlineKeyboardButton(label, callback_data=f"folder_manage_{f['id']}")])
+        rows.append([InlineKeyboardButton("\u2795 New Folder", callback_data="folder_new")])
+
+        text = "\U0001F4C1 *Folders*\n\nTap to manage, or create a new one:" if folders \
+            else "\U0001F4C1 No folders yet.\n\n\u2795 Start with New Folder."
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+            )
+
+    async def cb_folder_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        self._reset_owner_state()
+        self.awaiting_new_folder_name = True
+        await q.edit_message_text("\U0001F4C1 Send the name for the new folder:")
+
+    async def cb_folder_manage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_manage_", ""))
+        folder = await self.db.fetchrow(
+            "SELECT id, name, channel_id, source_channel_id FROM folders WHERE id = $1", folder_id
+        )
+        if not folder:
+            await q.edit_message_text("\u274c Folder not found.")
+            return
+
+        channel_line = folder["channel_id"] or "\u26a0\ufe0f not set"
+        source_line = folder["source_channel_id"] or "\u26a0\ufe0f not set"
+        text = (
+            f"\U0001F4C1 *{folder['name']}*\n\n"
+            f"\U0001F4E4 Output channel (buttons posted here): `{channel_line}`\n"
+            f"\U0001F4E5 Source channel (bot reads audio from here): `{source_line}`"
+        )
+        rows = [
+            [InlineKeyboardButton("\u270f\ufe0f Update Output Channel", callback_data=f"folder_setchannel_{folder_id}")],
+            [InlineKeyboardButton("\u270f\ufe0f Update Source Channel", callback_data=f"folder_setsource_{folder_id}")],
+            [InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="folder_list")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+    async def cb_folder_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        await self._show_folder_management(update, ctx)
+
+    async def cb_folder_setchannel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_setchannel_", ""))
+        self._reset_owner_state()
+        self.awaiting_channel_id_for_folder = folder_id
+        await q.edit_message_text(
+            "\U0001F4E1 Send the Channel ID (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
+            "\u26a0\ufe0f The bot must be made an admin in that channel (with Post Messages permission)."
+        )
+
+    async def cb_folder_setsource(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_setsource_", ""))
+        self._reset_owner_state()
+        self.awaiting_source_channel_id_for_folder = folder_id
+        await q.edit_message_text(
+            "\U0001F4E5 Send the *source* Channel ID (e.g. @channelusername or -100xxxxxxxxxx) — "
+            "this is the private channel the bot will watch for new audio.\n\n"
+            "\u26a0\ufe0f The bot must be made an admin in that channel (any admin right is enough — "
+            "it only needs to *read* posts there, not send).",
+            parse_mode="Markdown"
+        )
+
+    def _get_folder_lock(self, folder_id: int) -> asyncio.Lock:
+        lock = self._folder_ingest_locks.get(folder_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._folder_ingest_locks[folder_id] = lock
+        return lock
+
+    async def _repost_all_pages_for_folder(self, folder_id, folder_name, new_channel_id, update, ctx):
+        batches = await self.db.fetch(
+            "SELECT id, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
+            folder_id
+        )
+        if not batches:
+            await update.message.reply_text("\u2139\ufe0f This folder has no batches yet — nothing to repost.")
+            return
+
+        total_pages = (len(batches) + PAGE_SIZE - 1) // PAGE_SIZE
+        await update.message.reply_text(
+            f"\U0001F501 Reposting {total_pages} message(s) to the new channel... this will take some time."
+        )
+
+        REPOST_DELAY = 2
+        success_count = 0
+        failed_pages = []
+
+        for page_index in range(1, total_pages + 1):
+            try:
+                # New channel = old message_id is invalid there, so
+                # force_new=True skips the edit attempt and sends fresh.
+                await self.render_folder_page(
+                    folder_id, folder_name, new_channel_id, page_index, ctx, force_new=True
+                )
+                success_count += 1
+            except Exception as e:
+                logger.error("Repost failed for folder %s page %s: %s", folder_id, page_index, e)
+                failed_pages.append(page_index)
+
+            await asyncio.sleep(REPOST_DELAY)
+
+        summary = f"\u2705 {success_count}/{total_pages} messages reposted to the new channel."
+        if failed_pages:
+            summary += f"\n\u26a0\ufe0f Failed: page #{', #'.join(str(i) for i in failed_pages)}"
+        await update.message.reply_text(summary)
+
+    # ── Automatic ingestion from a folder's source channel (converted from
+    # bot.py's handle_channel_audio / _ingest_channel_audio / render_folder_page
+    # group). Fires on any audio posted in a channel the bot is admin in;
+    # everything not matching a registered source_channel_id for THIS
+    # clone's folders is ignored, so one clone's ingestion can't pick up
+    # another clone's channel even if both bots are admins in it. ───────
+    def _extract_episode_no(self, text: str) -> str | None:
+        if not text:
+            return None
+        for pattern in EPISODE_EXTRACT_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                return str(int(m.group(1)))
+        return None
+
+    async def _ingest_channel_audio(self, folder, telegram_file_id: str, message_id: str,
+                                     episode_no: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        folder_id = folder["id"]
+        channel_id = folder["channel_id"]
+
+        dup = await self.db.fetchrow(
+            """SELECT a.id FROM audios a
+               JOIN batches b ON b.id = a.batch_id
+               WHERE b.folder_id = $1 AND a.episode_no = $2""",
+            folder_id, episode_no
+        )
+        if dup:
+            logger.info(
+                "Episode %s already ingested for folder %s (message %s) — skipping duplicate.",
+                episode_no, folder_id, message_id,
+            )
+            return
+
+        existing = await self.db.fetchrow(
+            "SELECT id, total_links FROM batches "
+            "WHERE folder_id = $1 AND total_links < $2 ORDER BY created_at DESC LIMIT 1",
+            folder_id, BATCH_MAX
+        )
+
+        if existing:
+            batch_id = existing["id"]
+            await self.db.execute(
+                "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id) VALUES ($1, $2, $3, $4)",
+                batch_id, telegram_file_id, episode_no, message_id
+            )
+            await self.db.execute(
+                "UPDATE batches SET total_links = total_links + 1 WHERE id = $1", batch_id
+            )
+        else:
+            batch_count = await self.db.fetchval(
+                "SELECT COUNT(*) FROM batches WHERE folder_id = $1", folder_id
+            )
+            batch_name = f"{folder['name']} — Batch {batch_count + 1}"
+            batch_id = await self.db.fetchval(
+                "INSERT INTO batches (folder_id, total_links, name) VALUES ($1, $2, $3) RETURNING id",
+                folder_id, 1, batch_name
+            )
+            await self.db.execute(
+                "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id) VALUES ($1, $2, $3, $4)",
+                batch_id, telegram_file_id, episode_no, message_id
+            )
+
+        if channel_id:
+            try:
+                page_index = await self._page_index_for_batch(folder_id, batch_id)
+                await self.render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
+            except Exception as e:
+                logger.error("Channel page render failed for folder %s after ingest: %s", folder_id, e)
+
+    async def handle_channel_audio(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Fires on every audio posted in ANY channel this clone's bot is
+        admin in — filtered down to folders' registered source_channel_id
+        (scoped to this clone's own db, so no cross-clone leakage)."""
+        message = update.effective_message
+        if message is None or message.audio is None:
+            return
+
+        chat_id_str = str(message.chat.id)
+        folder = await self.db.fetchrow(
+            "SELECT id, name, channel_id FROM folders WHERE source_channel_id = $1", chat_id_str
+        )
+        if not folder:
+            return
+
+        source_text = message.caption or message.audio.file_name or message.audio.title or ""
+        episode_no = self._extract_episode_no(source_text)
+        if episode_no is None:
+            logger.warning(
+                "Could not extract an episode number for message %s in source "
+                "channel %s (folder \"%s\"); skipping.",
+                message.message_id, chat_id_str, folder["name"],
+            )
+            try:
+                await ctx.bot.send_message(
+                    chat_id=self.owner_id,
+                    text=(
+                        f"\u26a0\ufe0f Could not detect an episode number for a new audio in "
+                        f"\"{folder['name']}\" (message {message.message_id}). "
+                        f"It was NOT saved — add a number to the caption/filename and repost."
+                    )
+                )
+            except Exception:
+                pass
+            return
+
+        lock = self._get_folder_lock(folder["id"])
+        async with lock:
+            await self._ingest_channel_audio(
+                folder, message.audio.file_id, str(message.message_id), episode_no, ctx
+            )
+
+    async def _page_index_for_batch(self, folder_id: int, batch_id: int) -> int:
+        """1-based page number for this batch's position within the folder
+        (batches ordered oldest-to-newest by id)."""
+        position = await self.db.fetchval(
+            "SELECT COUNT(*) FROM batches WHERE folder_id = $1 AND id <= $2",
+            folder_id, batch_id
+        )
+        return ((position - 1) // PAGE_SIZE) + 1
+
+    def _page_text(self, folder_name: str, page_index: int, total_pages: int, total_in_page: int) -> str:
+        display_name = (folder_name or "Audio Collection").upper()
+
+        part_text = (
+            f"『 ℙ𝕒𝕣𝕥 {page_index} 』"
+            if total_pages > 1
+            else "『 ℂ𝕠𝕞𝕡𝕝𝕖𝕥𝕖 』"
+        )
+
+        total_start = (page_index - 1) * 1000 + 1
+        total_end = min(page_index * 1000, total_pages * 1000)
+
+        return (
+            "╔════❖•❄️•❖════╗\n"
+            f"🎧 {display_name}\n"
+            f"{part_text}\n"
+            "╚════❖•❄️•❖════╝\n\n"
+            f"📦 Total Episodes: {total_start} to {total_end}\n"
+            "⚡ Instant Delivery\n"
+            "🎶 Premium Audio Collection\n\n"
+            "👇 Click the button below\n"
+            "to receive your episodes instantly."
+        )
+
+    def _page_buttons(self, batches_in_page: list, start_offset: int) -> InlineKeyboardMarkup:
+        rows = []
+        running = start_offset
+        for b in batches_in_page:
+            end = running + b["total_links"] - 1
+            label = f"Ep ❄️ {running} to {end}" if b["total_links"] > 1 else f"Ep ❄️ {running}"
+            rows.append([InlineKeyboardButton(label, url=f"https://t.me/{self.bot_username}?start=batch_{b['id']}")])
+            running = end + 1
+        return InlineKeyboardMarkup(rows)
+
+    async def render_folder_page(self, folder_id: int, folder_name: str, channel_id: str, page_index: int, ctx,
+                                  force_new: bool = False) -> None:
+        """(Re)builds a folder's page (max 20 batches/buttons) channel
+        message. Edits the existing message if one exists for this page,
+        otherwise sends a new one. force_new=True (used on channel switch)
+        always sends fresh rather than trying to edit a message_id that
+        belonged to the OLD channel."""
+        all_batches = await self.db.fetch(
+            "SELECT id, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
+            folder_id
+        )
+        total_pages = (len(all_batches) + PAGE_SIZE - 1) // PAGE_SIZE
+        if total_pages == 0 or page_index > total_pages:
+            return
+
+        start_slice = (page_index - 1) * PAGE_SIZE
+        end_slice = start_slice + PAGE_SIZE
+        batches_in_page = all_batches[start_slice:end_slice]
+        start_offset = sum(b["total_links"] for b in all_batches[:start_slice]) + 1
+        total_in_page = sum(b["total_links"] for b in batches_in_page)
+
+        text = self._page_text(folder_name, page_index, total_pages, total_in_page)
+        markup = self._page_buttons(batches_in_page, start_offset)
+
+        page_row = await self.db.fetchrow(
+            "SELECT channel_message_id FROM folder_pages WHERE folder_id = $1 AND page_index = $2",
+            folder_id, page_index
+        )
+
+        edited = False
+        if page_row and page_row["channel_message_id"] and not force_new:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=channel_id,
+                    message_id=int(page_row["channel_message_id"]),
+                    text=text,
+                    reply_markup=markup
+                )
+                edited = True
+            except Exception as e:
+                logger.warning("Edit failed for folder %s page %s, sending new: %s", folder_id, page_index, e)
+
+        if not edited:
+            msg = await ctx.bot.send_message(chat_id=channel_id, text=text, reply_markup=markup)
+            await self.db.execute(
+                """
+                INSERT INTO folder_pages (folder_id, page_index, channel_message_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (folder_id, page_index)
+                DO UPDATE SET channel_message_id = EXCLUDED.channel_message_id
+                """,
+                folder_id, page_index, str(msg.message_id)
+            )
+
+    # ── text-wizard state machine for the folder flows above (converted
+    # from the folder-related branches of bot.py's handle_links). Scoped
+    # to self.owner_id only — non-owner text (episode search / public
+    # link intake) is NOT ported here yet, so non-owner messages are
+    # ignored rather than silently mishandled. ──────────────────────────
+    async def handle_owner_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        text = (update.message.text or "").strip()
+
+        if self.awaiting_new_folder_name:
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Folder name cannot be empty.")
+                return
+            self.awaiting_new_folder_name = False
+            try:
+                folder_id = await self.db.fetchval(
+                    "INSERT INTO folders (name) VALUES ($1) RETURNING id", text
+                )
+            except Exception:
+                await update.message.reply_text(
+                    f"\u26a0\ufe0f A folder named \"{text}\" already exists. Try /folders again."
+                )
+                return
+
+            self.awaiting_channel_id_for_folder = folder_id
+            self.new_folder_pending_source = True
+            await update.message.reply_text(
+                f"\u2705 Folder \"{text}\" created.\n\n"
+                f"\U0001F4E1 Now send this folder's *Output* Channel ID (e.g. @channelusername or -100xxxxxxxxxx) "
+                f"— where the batch/page buttons will be posted.\n\n"
+                f"\u26a0\ufe0f The bot must be made an admin in that channel (with Post Messages permission).",
+                parse_mode="Markdown"
+            )
+            return
+
+        if self.awaiting_channel_id_for_folder is not None:
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Channel ID cannot be empty.")
+                return
+            folder_id = self.awaiting_channel_id_for_folder
+            is_new_folder_wizard = self.new_folder_pending_source
+
+            folder_before = await self.db.fetchrow(
+                "SELECT channel_id FROM folders WHERE id = $1", folder_id
+            )
+            had_previous_channel = bool(folder_before and folder_before["channel_id"])
+
+            try:
+                await ctx.bot.send_message(chat_id=text, text="\u2705 Channel linked successfully.")
+                await self.db.execute(
+                    "UPDATE folders SET channel_id = $1 WHERE id = $2", text, folder_id
+                )
+                self.awaiting_channel_id_for_folder = None
+                self.new_folder_pending_source = False
+                await update.message.reply_text("\u2705 Output Channel ID saved and verified.")
+            except Exception as e:
+                self.awaiting_channel_id_for_folder = None
+                self.new_folder_pending_source = False
+                logger.error("Channel verify failed for folder %s: %s", folder_id, e)
+                await update.message.reply_text(
+                    "\u274c Channel ID not saved — the bot could not post there.\n"
+                    "Please check: (1) the ID is correct (2) the bot is an admin in that channel "
+                    "(3) Post Messages permission is ON.\n\n"
+                    "Try again via /folders."
+                )
+                return
+
+            if is_new_folder_wizard:
+                self.awaiting_source_channel_id_for_folder = folder_id
+                await update.message.reply_text(
+                    "\U0001F4E5 Now send this folder's *Source* Channel ID (e.g. @channelusername or -100xxxxxxxxxx) "
+                    "— the private channel the bot will watch for new audio.\n\n"
+                    "\u26a0\ufe0f The bot must be made an admin there too (any admin right is enough — "
+                    "it only needs to *read* posts there, not send).",
+                    parse_mode="Markdown"
+                )
+                return
+
+            if had_previous_channel:
+                folder_row = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
+                await self._repost_all_pages_for_folder(folder_id, folder_row["name"], text, update, ctx)
+            return
+
+        if self.awaiting_source_channel_id_for_folder is not None:
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Channel ID cannot be empty.")
+                return
+            folder_id = self.awaiting_source_channel_id_for_folder
+
+            try:
+                chat = await ctx.bot.get_chat(text)
+                me = await ctx.bot.get_me()
+                member = await ctx.bot.get_chat_member(chat_id=chat.id, user_id=me.id)
+                if member.status not in ("administrator", "creator"):
+                    raise ValueError("bot is not an admin in that channel")
+            except Exception as e:
+                self.awaiting_source_channel_id_for_folder = None
+                logger.error("Source channel verify failed for folder %s: %s", folder_id, e)
+                await update.message.reply_text(
+                    "\u274c Source Channel ID not saved.\n"
+                    "Please check: (1) the ID is correct (2) the bot is an admin there.\n\n"
+                    "Try again via /folders."
+                )
+                return
+
+            existing_owner = await self.db.fetchrow(
+                "SELECT id, name FROM folders WHERE source_channel_id = $1 AND id != $2",
+                str(chat.id), folder_id
+            )
+            if existing_owner:
+                self.awaiting_source_channel_id_for_folder = None
+                await update.message.reply_text(
+                    f"\u26a0\ufe0f That channel is already the source channel for folder \"{existing_owner['name']}\"."
+                )
+                return
+
+            await self.db.execute(
+                "UPDATE folders SET source_channel_id = $1 WHERE id = $2", str(chat.id), folder_id
+            )
+            self.awaiting_source_channel_id_for_folder = None
+            await update.message.reply_text(
+                "\u2705 Source channel saved and verified.\n\n"
+                "Any audio posted in that channel from now on will be picked up automatically."
+            )
+            return
+
+        if self.awaiting_force_join_edit_channel_id is not None:
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Invite link cannot be empty.")
+                return
+            await self.db.execute(
+                "UPDATE force_join_channels SET invite_link = $1 WHERE channel_id = $2",
+                text, self.awaiting_force_join_edit_channel_id
+            )
+            self.awaiting_force_join_edit_channel_id = None
+            await update.message.reply_text("\u2705 Invite link updated.")
+            return
+
+        if self.awaiting_force_join_step == "id":
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Channel/Group ID cannot be empty.")
+                return
+
+            count = await self.db.fetchval("SELECT COUNT(*) FROM force_join_channels")
+            if count >= FORCE_JOIN_LIMIT:
+                self.awaiting_force_join_step = None
+                await update.message.reply_text(
+                    f"\u26a0\ufe0f Limit reached — max {FORCE_JOIN_LIMIT} force-join channels. "
+                    "Remove one via /forcejoin before adding another."
+                )
+                return
+
+            try:
+                chat = await ctx.bot.get_chat(text)
+
+                if chat.type not in ("channel", "supergroup", "group"):
+                    await update.message.reply_text("\u274c Only channels and groups can be added.")
+                    return
+
+                me = await ctx.bot.get_me()
+                member = await ctx.bot.get_chat_member(chat_id=chat.id, user_id=me.id)
+                if member.status not in ("administrator", "creator"):
+                    raise ValueError("bot is not an admin")
+
+            except Exception as e:
+                logger.exception("Force-join verification failed for clone %s", self.clone_id)
+                self.awaiting_force_join_step = None
+                await update.message.reply_text(
+                    f"\u274c Verification failed:\n\n{e}\n\n"
+                    "Please check:\n"
+                    "• The ID is correct\n"
+                    "• The bot is an admin\n"
+                    "• The group/channel is accessible"
+                )
+                return
+
+            existing = await self.db.fetchrow(
+                "SELECT id FROM force_join_channels WHERE channel_id = $1", str(chat.id)
+            )
+            if existing:
+                self.awaiting_force_join_step = None
+                await update.message.reply_text("\u26a0\ufe0f This channel/group is already in the force-join list.")
+                return
+
+            self.force_join_pending_channel_id = str(chat.id)
+            self.force_join_pending_title = chat.title or chat.username or text
+            self.awaiting_force_join_step = "link"
+            await update.message.reply_text(
+                f"\u2705 \"{self.force_join_pending_title}\" verified.\n\n"
+                f"\U0001F517 Now send its invite link — for a public channel, https://t.me/username "
+                f"also works; for a private one, use a link exported/created via the bot.\n\n"
+                f"\u2139\ufe0f If you need an approval-required (join request) link, generate that "
+                f"link yourself in Telegram and paste it here — the bot does not create "
+                f"an approval-required link on its own."
+            )
+            return
+
+        if self.awaiting_force_join_step == "link":
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Invite link cannot be empty.")
+                return
+            await self.db.execute(
+                "INSERT INTO force_join_channels (channel_id, invite_link, title) VALUES ($1, $2, $3)",
+                self.force_join_pending_channel_id, text, self.force_join_pending_title
+            )
+            title_done = self.force_join_pending_title
+            self.awaiting_force_join_step = None
+            self.force_join_pending_channel_id = None
+            self.force_join_pending_title = None
+            await update.message.reply_text(f"\u2705 \"{title_done}\" added to the force-join list.")
+            return
+
+        # No owner-wizard state pending and no other owner-text feature
+        # (broadcast) ported yet — see module docstring.
+
+    # ── build & wire the Application for this clone ─────────────────────
+    def build_application(self) -> Application:
+        request = HTTPXRequest(connection_pool_size=8)
+        app = (
+            Application.builder()
+            .token(self.bot_token)
+            .request(request)
+            .build()
+        )
+        app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("folders", self.cmd_folders))
+        app.add_handler(CommandHandler("forcejoin", self.cmd_forcejoin))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_new, pattern=r"^folder_new$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_manage, pattern=r"^folder_manage_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_list, pattern=r"^folder_list$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_setchannel, pattern=r"^folder_setchannel_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_setsource, pattern=r"^folder_setsource_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_checkjoin, pattern=r"^checkjoin_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_cancel_send, pattern=r"^cancelsend_\d+$", block=False))
+        app.add_handler(CallbackQueryHandler(self.cb_forcejoin_list, pattern=r"^forcejoin_list$"))
+        app.add_handler(CallbackQueryHandler(self.cb_forcejoin_add, pattern=r"^forcejoin_add$"))
+        app.add_handler(CallbackQueryHandler(self.cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_forcejoin_editlink, pattern=r"^forcejoin_editlink_\d+$"))
+        app.add_handler(ChatJoinRequestHandler(self.cb_chat_join_request))
+        # Must be registered before the text handler: both could in
+        # principle match overlapping updates, and only the first matching
+        # handler in a group runs. ChatType.CHANNEL scopes this to channel
+        # posts only, so it never intercepts audio sent to the bot in a
+        # private chat.
+        app.add_handler(MessageHandler(filters.AUDIO & filters.ChatType.CHANNEL, self.handle_channel_audio))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_owner_text))
+        # ... remaining handlers from bot.py's main() go here, each bound
+        # to `self` once ported per the checklist at the top of this file.
+
+        return app
+
+    async def connect_db(self):
+        """Must be called explicitly before the Application starts polling.
+
+        NOTE: this used to be wired up as `app.post_init`, but post_init is
+        only invoked by PTB's own run_polling()/run_webhook() convenience
+        wrappers. CloneRunner drives the Application lifecycle manually
+        (initialize/start/updater.start_polling), so post_init never fired —
+        any clone with its own supabase_url had self.db.pool stuck at None
+        and crashed on first query. Call this from CloneRunner._run_one
+        before app.initialize() instead.
+        """
+        if isinstance(self.db, Database):
+            await self.db.connect()
+            await self.db.init_schema()
