@@ -362,7 +362,8 @@ async def receive_clone_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "This platform requires every clone to use its own Supabase project — "
         "your folders/files are never shared with the main bot or other clones.\n\n"
         "Send your Supabase Postgres connection string "
-        "(Project Settings \u2192 Database \u2192 Connection string \u2192 URI, "
+        "(Project  \u2192 Connect \u2192  Direct connection string \u2192 Session pooler \n"
+        "\u2192 Connection string \u2192 URI, "
         "Session Pooler mode).\n\n"
         "Send /cancel to stop."
     )
