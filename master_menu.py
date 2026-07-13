@@ -383,6 +383,9 @@ async def receive_supabase_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Got it. Now send your Supabase service_role (or anon) API key, "
         "so the dashboard can store it alongside the connection string.\n\n"
+        "Send your Supabase Postgres connection string "
+        "(Project  \u2192 project setting \u2192 API Key \u2192 legacy anon, service_role API Key \n"
+        "\u2192 service_role secret \u2192 URI,\n\n"
         "Send /cancel to stop."
     )
     return WAITING_FOR_SUPABASE_KEY
