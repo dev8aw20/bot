@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+.env.*
+*.log
+tempCodeRunnerFile.py
+.vscode/
+.idea/
