@@ -96,9 +96,13 @@ async def cb_startmsg_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_clone_settings(clone_id)
-    current = settings["start_msg"] or f"(using default) {DEFAULT_START_MSG}"
     await q.answer()
-    await q.message.reply_text(current)
+    await q.message.reply_text(
+        current,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"csm_menu_{clone_id}")]]
+        ),
+    )
 
 
 async def cb_startmsg_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -330,7 +334,12 @@ async def cb_moderators_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mods = await central_db.list_moderators(clone_id)
     await q.answer()
     text = "Moderators:\n" + ("\n".join(mods) if mods else "(none)")
-    await q.message.reply_text(text)
+    await q.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"mod_menu_{clone_id}")]]
+        ),
+    )
 
 
 # ── AUTO DELETE ───────────────────────────────────────────────────────────
@@ -342,13 +351,19 @@ async def cb_autodelete_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     central_db = ctx.application.bot_data["central_db"]
     s = await central_db.get_clone_settings(clone_id)
-    status = f"Enabled \u2705 - Time: {s['auto_delete_minutes']} Mins" if s["auto_delete_enabled"] else "Disabled \u274c"
+    current_minutes = s["auto_delete_minutes"]
+    status = f"Enabled \u2705 - Time: {current_minutes} Mins" if s["auto_delete_enabled"] else "Disabled \u274c"
     await q.answer()
+
+    def _label(text, minutes):
+        return f"\u2705 {text}" if s["auto_delete_enabled"] and current_minutes == minutes else text
+
     buttons = [
         [InlineKeyboardButton("Disable \u274c", callback_data=f"ad_toggle_{clone_id}")],
-        [InlineKeyboardButton("5m", callback_data=f"ad_time_{clone_id}_5"),
-         InlineKeyboardButton("15m", callback_data=f"ad_time_{clone_id}_15"),
-         InlineKeyboardButton("1h", callback_data=f"ad_time_{clone_id}_60")],
+        [InlineKeyboardButton(_label("5m", 5), callback_data=f"ad_time_{clone_id}_5"),
+         InlineKeyboardButton(_label("15m", 15), callback_data=f"ad_time_{clone_id}_15"),
+         InlineKeyboardButton(_label("1h", 60), callback_data=f"ad_time_{clone_id}_60")],
+        [InlineKeyboardButton("Custom Time", callback_data=f"ad_time_custom_{clone_id}")],
         [InlineKeyboardButton("Message", callback_data=f"ad_msg_{clone_id}")],
         [InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")],
     ]
@@ -382,6 +397,17 @@ async def cb_autodelete_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await q.answer(f"Set to {minutes} minutes.")
     await cb_autodelete_menu(update, ctx)
+
+
+async def cb_autodelete_time_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return ConversationHandler.END
+    ctx.user_data["editing"] = ("auto_delete_minutes_custom", clone_id)
+    await q.edit_message_text("Send the number of minutes (1-1440). /cancel to stop.")
+    return AWAITING_INPUT
 
 
 async def cb_autodelete_msg_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -424,7 +450,12 @@ async def cb_autodelete_msg_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = await central_db.get_clone_settings(clone_id)
     current = s["auto_delete_message"] or f"(using default) {DEFAULT_AUTO_DELETE_MSG}"
     await q.answer()
-    await q.message.reply_text(current)
+    await q.message.reply_text(
+        current,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"ad_msg_{clone_id}")]]
+        ),
+    )
 
 
 async def cb_autodelete_msg_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -548,7 +579,12 @@ async def cb_clone_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         users = await clone_db.fetchval("SELECT COUNT(*) FROM users") or 0
     except Exception:
         logger.exception("Stats query failed for clone %s", clone_id)
-        await q.message.reply_text("Couldn't read stats — clone's database may not be reachable.")
+        await q.message.reply_text(
+            "Couldn't read stats — clone's database may not be reachable.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")]]
+            ),
+        )
         return
     finally:
         if clone_db is not ctx.application.bot_data["central_db"]:
@@ -558,7 +594,10 @@ async def cb_clone_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     running = "running" if runner.is_running(clone_id) else "stopped"
     await q.message.reply_text(
         f"\U0001F4CA Stats for @{clone['bot_username']} ({running})\n\n"
-        f"Folders: {folders}\nBatches: {batches}\nAudios: {audios}\nUsers: {users}"
+        f"Folders: {folders}\nBatches: {batches}\nAudios: {audios}\nUsers: {users}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")]]
+        ),
     )
 
 
@@ -684,7 +723,12 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if field == "start_msg":
         await central_db.update_clone_settings(clone_id, start_msg=text)
-        await update.message.reply_text("\u2705 Start message updated.")
+        await update.message.reply_text(
+            "\u2705 Start message updated.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"csm_menu_{clone_id}")]]
+            ),
+        )
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
 
@@ -755,7 +799,12 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         finally:
             await _clone_db_release(clone_db, owns)
-        await update.message.reply_text(f"\u2705 \"{pending['title']}\" added to FORCE SUB.")
+        await update.message.reply_text(
+            f"\u2705 \"{pending['title']}\" added to FORCE SUB.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"fsub_menu_{clone_id}")]]
+            ),
+        )
         ctx.user_data.pop("fsub_pending", None)
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
@@ -765,13 +814,42 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("That's not a numeric Telegram user ID. Send again, or /cancel.")
             return AWAITING_INPUT
         await central_db.add_moderator(clone_id, text)
-        await update.message.reply_text(f"\u2705 {text} added as moderator.")
+        await update.message.reply_text(
+            f"\u2705 {text} added as moderator.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"mod_menu_{clone_id}")]]
+            ),
+        )
+        ctx.user_data.pop("editing", None)
+        return ConversationHandler.END
+
+    if field == "auto_delete_minutes_custom":
+        if not text.isdigit() or not (1 <= int(text) <= 1440):
+            await update.message.reply_text(
+                "\u26a0\ufe0f Send a whole number of minutes between 1 and 1440. Or /cancel."
+            )
+            return AWAITING_INPUT
+        minutes = int(text)
+        await central_db.update_clone_settings(
+            clone_id, auto_delete_minutes=minutes, auto_delete_enabled=True
+        )
+        await update.message.reply_text(
+            f"\u2705 Set to {minutes} minutes.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"ad_menu_{clone_id}")]]
+            ),
+        )
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
 
     if field == "auto_delete_message":
         await central_db.update_clone_settings(clone_id, auto_delete_message=text)
-        await update.message.reply_text("\u2705 Auto-delete message updated.")
+        await update.message.reply_text(
+            "\u2705 Auto-delete message updated.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"ad_msg_{clone_id}")]]
+            ),
+        )
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
 
@@ -829,6 +907,7 @@ def register(application: Application):
             CallbackQueryHandler(cb_forcesub_add, pattern=r"^fsub_add_\d+$"),
             CallbackQueryHandler(cb_moderators_add, pattern=r"^mod_add_\d+$"),
             CallbackQueryHandler(cb_autodelete_msg_edit, pattern=r"^ad_msg_edit_\d+$"),
+            CallbackQueryHandler(cb_autodelete_time_custom, pattern=r"^ad_time_custom_\d+$"),
             CallbackQueryHandler(cb_transferdb_start, pattern=r"^tdb_start_\d+$"),
         ],
         states={

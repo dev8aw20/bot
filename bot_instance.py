@@ -69,6 +69,10 @@ DEFAULT_AUTO_DELETE_MSG = (
 # for it. If that changes, move this to clone_settings and read it per-row
 # in BotInstance.__init__ instead.
 UPDATE_CHANNEL_URL = os.environ.get("UPDATE_CHANNEL_URL", "").strip()
+# Same BOT_USERNAME env var bot.py (the master) requires for itself — one
+# process, one env, so it's already set. Used to build a deep link back to
+# the master bot from inside a clone (see _continue_after_gates below).
+MASTER_BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
 
 EPISODE_EXTRACT_PATTERNS = [
     re.compile(r'(?:episode|ep)\.?\s*#?\s*(\d+)', re.IGNORECASE),
@@ -112,6 +116,7 @@ class BotInstance:
         self.awaiting_new_folder_name: bool = False
         self.awaiting_channel_id_for_folder: int | None = None
         self.awaiting_source_channel_id_for_folder: int | None = None
+        self.awaiting_rename_folder_id: int | None = None
         self.new_folder_pending_source: bool = False
         self.pending_broadcast_text: str | None = None
         self.awaiting_force_join_step: str | None = None   # None | "id" | "link"
@@ -129,6 +134,7 @@ class BotInstance:
         self.awaiting_new_folder_name = False
         self.awaiting_channel_id_for_folder = None
         self.awaiting_source_channel_id_for_folder = None
+        self.awaiting_rename_folder_id = None
         self.new_folder_pending_source = False
         self.pending_broadcast_text = None
         self.awaiting_force_join_step = None
@@ -151,7 +157,12 @@ class BotInstance:
 
         if user.id == self.owner_id and (not args or not args[0].startswith("batch_")):
             label = "the owner" if settings["hide_owner"] else f"owner of @{self.bot_username}"
-            await update.effective_message.reply_text(f"Welcome back, {label}.")
+            await update.effective_message.reply_text(
+                f"Welcome back, {label}.\n\nUse /folders to manage your folders.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\U0001F4C1 Manage Folders", callback_data="folder_list")]]
+                ),
+            )
             return
 
         if not self.is_public and user.id != self.owner_id:
@@ -174,11 +185,21 @@ class BotInstance:
         already ran (in cmd_start, or in cb_checkjoin before calling this)
         — do NOT re-check here, or a re-verify inside cb_checkjoin loops."""
         if not args or not args[0].startswith("batch_"):
+            user = update.effective_user
             text = settings["start_msg"] or (
+                f"Hello {user.first_name} \u2728\n\n"
                 "Send me a shared link to get your files, or ask the owner "
                 "of this bot for one."
             )
-            await update.effective_message.reply_text(text)
+            markup = None
+            if MASTER_BOT_USERNAME:
+                markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(
+                        "CREATE MY OWN CLONE",
+                        url=f"https://t.me/{MASTER_BOT_USERNAME}?start=settings",
+                    )]]
+                )
+            await update.effective_message.reply_text(text, reply_markup=markup)
             return
 
         batch_id = int(args[0].replace("batch_", ""))
@@ -631,11 +652,65 @@ class BotInstance:
             f"\U0001F4E5 Source channel (bot reads audio from here): `{source_line}`"
         )
         rows = [
+            [InlineKeyboardButton("\U0001F4DD Rename Folder", callback_data=f"folder_rename_{folder_id}")],
             [InlineKeyboardButton("\u270f\ufe0f Update Output Channel", callback_data=f"folder_setchannel_{folder_id}")],
             [InlineKeyboardButton("\u270f\ufe0f Update Source Channel", callback_data=f"folder_setsource_{folder_id}")],
+            [InlineKeyboardButton("\U0001F5D1\ufe0f Delete Folder", callback_data=f"folder_delete_{folder_id}")],
             [InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="folder_list")],
         ]
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+    async def cb_folder_rename(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_rename_", ""))
+        folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
+        if not folder:
+            await q.edit_message_text("\u274c Folder not found.")
+            return
+        self._reset_owner_state()
+        self.awaiting_rename_folder_id = folder_id
+        await q.edit_message_text(f"\U0001F4DD Send the new name for \"{folder['name']}\":")
+
+    async def cb_folder_delete_confirm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """First tap — asks for confirmation, doesn't delete anything yet.
+        This is destructive: it wipes the folder's batches and audio
+        records too (delete_folder_cascade), not just the folder row."""
+        q = update.callback_query
+        await q.answer()
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_delete_", ""))
+        folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
+        if not folder:
+            await q.edit_message_text("\u274c Folder not found.")
+            return
+        rows = [
+            [InlineKeyboardButton("\u2705 Yes, delete it", callback_data=f"folder_delete_yes_{folder_id}")],
+            [InlineKeyboardButton("\u274c Cancel", callback_data=f"folder_manage_{folder_id}")],
+        ]
+        await q.edit_message_text(
+            f"\u26a0\ufe0f Delete *{folder['name']}*?\n\n"
+            f"This permanently removes the folder AND every batch/audio "
+            f"record under it. This cannot be undone.",
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown",
+        )
+
+    async def cb_folder_delete_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            return
+        folder_id = int(q.data.replace("folder_delete_yes_", ""))
+        folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
+        if not folder:
+            await q.answer()
+            await q.edit_message_text("\u274c Folder not found.")
+            return
+        await self.db.delete_folder_cascade(folder_id)
+        await q.answer("Deleted.")
+        await self._show_folder_management(update, ctx)
 
     async def cb_folder_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
@@ -935,6 +1010,27 @@ class BotInstance:
             return
         text = (update.message.text or "").strip()
 
+        if self.awaiting_rename_folder_id is not None:
+            folder_id = self.awaiting_rename_folder_id
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f Folder name cannot be empty.")
+                return
+            self.awaiting_rename_folder_id = None
+            try:
+                await self.db.execute("UPDATE folders SET name = $1 WHERE id = $2", text, folder_id)
+            except Exception:
+                await update.message.reply_text(
+                    f"\u26a0\ufe0f A folder named \"{text}\" already exists. Try again from /folders."
+                )
+                return
+            await update.message.reply_text(
+                f"\u2705 Folder renamed to \"{text}\".",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data=f"folder_manage_{folder_id}")]]
+                ),
+            )
+            return
+
         if self.awaiting_new_folder_name:
             if not text:
                 await update.message.reply_text("\u26a0\ufe0f Folder name cannot be empty.")
@@ -1158,6 +1254,9 @@ class BotInstance:
         app.add_handler(CallbackQueryHandler(self.cb_folder_list, pattern=r"^folder_list$"))
         app.add_handler(CallbackQueryHandler(self.cb_folder_setchannel, pattern=r"^folder_setchannel_\d+$"))
         app.add_handler(CallbackQueryHandler(self.cb_folder_setsource, pattern=r"^folder_setsource_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_rename, pattern=r"^folder_rename_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_delete_confirm, pattern=r"^folder_delete_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_folder_delete_execute, pattern=r"^folder_delete_yes_\d+$"))
         app.add_handler(CallbackQueryHandler(self.cb_checkjoin, pattern=r"^checkjoin_\d+$"))
         app.add_handler(CallbackQueryHandler(self.cb_cancel_send, pattern=r"^cancelsend_\d+$", block=False))
         app.add_handler(CallbackQueryHandler(self.cb_forcejoin_list, pattern=r"^forcejoin_list$"))

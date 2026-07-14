@@ -52,6 +52,23 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchval(query, *args)
 
+    async def delete_folder_cascade(self, folder_id: int):
+        """Deletes a folder and everything under it (its batches, then
+        their audios) in one transaction. folders/batches/audios have no
+        ON DELETE CASCADE on their foreign keys, so deleting the folder
+        row alone fails with a FK violation the moment it has any batches
+        — this does the three deletes in the right order, atomically, so
+        a mid-way failure can't leave orphaned batches/audios behind."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM audios WHERE batch_id IN "
+                    "(SELECT id FROM batches WHERE folder_id = $1)",
+                    folder_id,
+                )
+                await conn.execute("DELETE FROM batches WHERE folder_id = $1", folder_id)
+                await conn.execute("DELETE FROM folders WHERE id = $1", folder_id)
+
     async def init_schema(self):
         await self.execute("""
             CREATE TABLE IF NOT EXISTS folders (

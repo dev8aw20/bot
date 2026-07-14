@@ -124,7 +124,7 @@ async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Master bot's own settings — NOT per-clone (clones have their own
 # dashboard, reached via "MY CLONE BOT" below). Backed by db.bot_settings,
 # a singleton row (id=1).
-async def _render_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def _settings_menu_content(ctx: ContextTypes.DEFAULT_TYPE):
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
     protect_label = "PROTECT CONTENT \u2611\ufe0f" if settings["protect_content"] else "PROTECT CONTENT \u2610"
@@ -136,7 +136,20 @@ async def _render_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("\u2039 BACK", callback_data="menu_help")],
     ]
     text = "\U0001F6E0\ufe0f Settings... Customize your settings as your need"
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def _render_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text, markup = await _settings_menu_content(ctx)
+    await update.callback_query.edit_message_text(text, reply_markup=markup)
+
+
+async def send_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """For the plain-message case — a clone's 'CREATE MY OWN CLONE' button
+    deep-links here via /start settings (see bot_instance.py's
+    _continue_after_gates), which has no callback_query to edit."""
+    text, markup = await _settings_menu_content(ctx)
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 async def cb_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -190,7 +203,12 @@ async def cb_settings_caption_edit(update: Update, ctx: ContextTypes.DEFAULT_TYP
 async def receive_custom_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     central_db = ctx.application.bot_data["central_db"]
     await central_db.update_bot_settings(custom_caption=update.message.text)
-    await update.message.reply_text("\u2705 Custom caption updated.")
+    await update.message.reply_text(
+        "\u2705 Custom caption updated.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data="settings_caption_menu")]]
+        ),
+    )
     return ConversationHandler.END
 
 
@@ -200,7 +218,12 @@ async def cb_settings_caption_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
     current = settings["custom_caption"] or "(not set — original captions are used as-is)"
-    await q.message.reply_text(current)
+    await q.message.reply_text(
+        current,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data="settings_caption_menu")]]
+        ),
+    )
 
 
 async def cb_settings_caption_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -275,7 +298,12 @@ async def receive_custom_button_line(update: Update, ctx: ContextTypes.DEFAULT_T
     existing = settings["custom_buttons"] or ""
     updated = (existing.rstrip() + "\n" + text).strip() if existing.strip() else text
     await central_db.update_bot_settings(custom_buttons=updated)
-    await update.message.reply_text("\u2705 Button row added.")
+    await update.message.reply_text(
+        "\u2705 Button row added.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data="settings_button_menu")]]
+        ),
+    )
     return ConversationHandler.END
 
 
@@ -314,9 +342,20 @@ async def cb_clone_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Send me the Telegram Bot HTTP API token for your new clone.\n\n"
         "Get one from @BotFather \u2192 /newbot. I'll validate it before "
         "creating the clone.\n\n"
-        "Send /cancel to stop."
+        "Send /cancel to stop.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data="clone_add_cancel")]]
+        ),
     )
     return WAITING_FOR_TOKEN
+
+
+async def cb_clone_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("pending_clone_token", None)
+    ctx.user_data.pop("pending_clone_username", None)
+    ctx.user_data.pop("pending_clone_supabase_url", None)
+    await cb_manage_clones(update, ctx)
+    return ConversationHandler.END
 
 
 async def receive_clone_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -362,8 +401,7 @@ async def receive_clone_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "This platform requires every clone to use its own Supabase project — "
         "your folders/files are never shared with the main bot or other clones.\n\n"
         "Send your Supabase Postgres connection string "
-        "(Project  \u2192 Connect \u2192  Direct connection string \u2192 Session pooler \n"
-        "\u2192 Connection string \u2192 URI, "
+        "(Project Settings \u2192 Database \u2192 Connection string \u2192 URI, "
         "Session Pooler mode).\n\n"
         "Send /cancel to stop."
     )
@@ -383,9 +421,6 @@ async def receive_supabase_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Got it. Now send your Supabase service_role (or anon) API key, "
         "so the dashboard can store it alongside the connection string.\n\n"
-        "Send your Supabase Postgres connection string "
-        "(Project  \u2192 project setting \u2192 API Key \u2192 legacy anon, service_role API Key \n"
-        "\u2192 service_role secret \u2192 URI,\n\n"
         "Send /cancel to stop."
     )
     return WAITING_FOR_SUPABASE_KEY
@@ -613,7 +648,10 @@ def register(application: Application):
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_supabase_key),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_clone_add)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_clone_add),
+            CallbackQueryHandler(cb_clone_add_cancel, pattern=r"^clone_add_cancel$"),
+        ],
     )
     application.add_handler(add_clone_conv)
 
