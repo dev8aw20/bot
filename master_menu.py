@@ -54,8 +54,8 @@ DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
 # Defaults for the ABOUT menu's two links — optional at deploy time.
 # /aboutset (below) lets the owner override either one from inside
 # Telegram without touching env vars; whichever bot_settings has wins.
-DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("SUPPORT_GROUP_LINK", "").strip()
-DEFAULT_ANOTHER_BOT_LINK = os.environ.get("ANOTHER_BOT_LINK", "").strip()
+DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("UPDATE_SUPPORT_GROUP", "").strip()
+DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
 
 WAITING_FOR_TOKEN = 1
 WAITING_FOR_SUPABASE_URL = 2
