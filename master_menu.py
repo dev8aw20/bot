@@ -45,14 +45,24 @@ logger = logging.getLogger(__name__)
 # than importing OWNER_ID from bot.py, which would create a circular
 # import (bot.py imports master_menu).
 OWNER_ID = int(os.environ["OWNER_ID"])
+# Defaults for the ABOUT page's two links — used only when the owner
+# hasn't set an override with /aboutset (see cb_about below). Optional:
+# missing env vars just mean that line is left off until /aboutset sets one.
+DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("UPDATE_SUPPORT_GROUP", "").strip()
+DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
+
+# Defaults for the ABOUT menu's two links — optional at deploy time.
+# /aboutset (below) lets the owner override either one from inside
+# Telegram without touching env vars; whichever bot_settings has wins.
+DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("SUPPORT_GROUP_LINK", "").strip()
+DEFAULT_ANOTHER_BOT_LINK = os.environ.get("ANOTHER_BOT_LINK", "").strip()
 
 WAITING_FOR_TOKEN = 1
 WAITING_FOR_SUPABASE_URL = 2
 WAITING_FOR_SUPABASE_KEY = 3
 AWAITING_CAPTION_TEXT = 4
 AWAITING_BUTTON_LINE = 5
-AWAITING_ABOUT_SUPPORT_LINK = 6
-AWAITING_ABOUT_BOT_LINK = 7
+AWAITING_ABOUT_EXTRA_LINK = 6
 MAX_CLONES_PER_USER = 2
 
 UPDATE_CHANNEL_URL = None  # bot.py sets this at import time — see wiring note below.
@@ -548,24 +558,40 @@ async def cb_clone_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── ABOUT MENU ────────────────────────────────────────────────────────────
-# Two permanent links (Support Group, Another Bot), owner-set via
-# /aboutset — not env vars, since the owner asked to be able to change
-# these from inside Telegram without a redeploy.
+# Support Group + Another Bot are FIXED — always the env-var defaults
+# (UPDATE_SUPPORT_GROUP, OTHER_BOT_URL), not owner-editable. /aboutset only
+# APPENDS extra links below those two, one "Label - URL" per /aboutset
+# call — same growable-list idiom as the CUSTOM BUTTON feature.
+def _parse_about_extra_links(raw):
+    if not raw or not raw.strip():
+        return []
+    out = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or " - " not in line:
+            continue
+        label, url = line.rsplit(" - ", 1)
+        label, url = label.strip(), url.strip()
+        if label and url:
+            out.append((label, url))
+    return out
+
+
 async def cb_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
-    support = settings["about_support_link"]
-    other_bot = settings["about_bot_link"]
 
     lines = ["\u2139\ufe0f About"]
-    if support:
-        lines.append(f"\nSupport group: [(Link)]({support})")
-    if other_bot:
-        lines.append(f"\nAnother bot: [(Link)]({other_bot})")
-    if not support and not other_bot:
-        lines.append("\n(Not set yet — the owner can set these with /aboutset.)")
+    if DEFAULT_SUPPORT_GROUP_LINK:
+        lines.append(f"\nSupport group: [(Link)]({DEFAULT_SUPPORT_GROUP_LINK})")
+    if DEFAULT_ANOTHER_BOT_LINK:
+        lines.append(f"\nAnother bot: [(Link)]({DEFAULT_ANOTHER_BOT_LINK})")
+    for label, url in _parse_about_extra_links(settings["about_extra_links"]):
+        lines.append(f"\n{label}: [(Link)]({url})")
+    if len(lines) == 1:
+        lines.append("\n(Nothing set yet.)")
 
     buttons = [[InlineKeyboardButton("\u2039 back", callback_data="menu_startup")]]
     await q.edit_message_text(
@@ -578,34 +604,27 @@ async def cmd_aboutset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     await update.message.reply_text(
-        "Send the Support Group link. /cancel to stop."
+        "Send an extra link to add to the ABOUT page, as \"Label - URL\" "
+        "(e.g. \"Backup Channel - https://t.me/mychannel\"). This is ADDED "
+        "below Support Group / Another Bot, not a replacement for them. "
+        "/cancel to stop."
     )
-    return AWAITING_ABOUT_SUPPORT_LINK
+    return AWAITING_ABOUT_EXTRA_LINK
 
 
-async def receive_about_support_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
-    if not (link.startswith("http://") or link.startswith("https://") or link.startswith("https://t.me/")):
+async def receive_about_extra_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not _parse_about_extra_links(text):
         await update.message.reply_text(
-            "\u26a0\ufe0f Send a full link starting with http:// or https://. Or /cancel."
+            "\u26a0\ufe0f Couldn't parse that — use \"Label - URL\". Send again, or /cancel."
         )
-        return AWAITING_ABOUT_SUPPORT_LINK
+        return AWAITING_ABOUT_EXTRA_LINK
     central_db = ctx.application.bot_data["central_db"]
-    await central_db.update_bot_settings(about_support_link=link)
-    await update.message.reply_text("\u2705 Support group link saved.\n\nNow send the Another Bot link. /cancel to stop.")
-    return AWAITING_ABOUT_BOT_LINK
-
-
-async def receive_about_bot_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
-    if not (link.startswith("http://") or link.startswith("https://")):
-        await update.message.reply_text(
-            "\u26a0\ufe0f Send a full link starting with http:// or https://. Or /cancel."
-        )
-        return AWAITING_ABOUT_BOT_LINK
-    central_db = ctx.application.bot_data["central_db"]
-    await central_db.update_bot_settings(about_bot_link=link)
-    await update.message.reply_text("\u2705 Another-bot link saved. Both links are set.")
+    settings = await central_db.get_bot_settings()
+    existing = settings["about_extra_links"] or ""
+    updated = (existing.rstrip() + "\n" + text).strip() if existing.strip() else text
+    await central_db.update_bot_settings(about_extra_links=updated)
+    await update.message.reply_text("\u2705 Added to the ABOUT page.")
     return ConversationHandler.END
 
 
@@ -751,11 +770,8 @@ def register(application: Application):
     aboutset_conv = ConversationHandler(
         entry_points=[CommandHandler("aboutset", cmd_aboutset)],
         states={
-            AWAITING_ABOUT_SUPPORT_LINK: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_support_link),
-            ],
-            AWAITING_ABOUT_BOT_LINK: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_bot_link),
+            AWAITING_ABOUT_EXTRA_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_extra_link),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_aboutset)],

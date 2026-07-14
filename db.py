@@ -221,7 +221,8 @@ class Database:
                 custom_buttons TEXT,
                 protect_content BOOLEAN NOT NULL DEFAULT FALSE,
                 about_support_link TEXT,
-                about_bot_link TEXT
+                about_bot_link TEXT,
+                about_extra_links TEXT
             )
         """)
 
@@ -235,6 +236,10 @@ class Database:
         await self.execute("""
             ALTER TABLE bot_settings
             ADD COLUMN IF NOT EXISTS about_bot_link TEXT
+        """)
+        await self.execute("""
+            ALTER TABLE bot_settings
+            ADD COLUMN IF NOT EXISTS about_extra_links TEXT
         """)
 
         # ── Clone platform: central registry of every user-created clone ──
