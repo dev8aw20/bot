@@ -219,8 +219,22 @@ class Database:
                 id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
                 custom_caption TEXT,
                 custom_buttons TEXT,
-                protect_content BOOLEAN NOT NULL DEFAULT FALSE
+                protect_content BOOLEAN NOT NULL DEFAULT FALSE,
+                about_support_link TEXT,
+                about_bot_link TEXT
             )
+        """)
+
+        # ADD COLUMN IF NOT EXISTS too, for bot_settings tables created
+        # before these two columns existed — CREATE TABLE IF NOT EXISTS
+        # above is a no-op on an already-existing table.
+        await self.execute("""
+            ALTER TABLE bot_settings
+            ADD COLUMN IF NOT EXISTS about_support_link TEXT
+        """)
+        await self.execute("""
+            ALTER TABLE bot_settings
+            ADD COLUMN IF NOT EXISTS about_bot_link TEXT
         """)
 
         # ── Clone platform: central registry of every user-created clone ──

@@ -28,6 +28,7 @@ something I'd stand behind without testing each flow.
 """
 
 import logging
+import os
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
@@ -40,11 +41,18 @@ from db import Database
 
 logger = logging.getLogger(__name__)
 
+# Same env var bot.py reads for itself — read independently here rather
+# than importing OWNER_ID from bot.py, which would create a circular
+# import (bot.py imports master_menu).
+OWNER_ID = int(os.environ["OWNER_ID"])
+
 WAITING_FOR_TOKEN = 1
 WAITING_FOR_SUPABASE_URL = 2
 WAITING_FOR_SUPABASE_KEY = 3
 AWAITING_CAPTION_TEXT = 4
 AWAITING_BUTTON_LINE = 5
+AWAITING_ABOUT_SUPPORT_LINK = 6
+AWAITING_ABOUT_BOT_LINK = 7
 MAX_CLONES_PER_USER = 2
 
 UPDATE_CHANNEL_URL = None  # bot.py sets this at import time — see wiring note below.
@@ -539,6 +547,73 @@ async def cb_clone_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
+# ── ABOUT MENU ────────────────────────────────────────────────────────────
+# Two permanent links (Support Group, Another Bot), owner-set via
+# /aboutset — not env vars, since the owner asked to be able to change
+# these from inside Telegram without a redeploy.
+async def cb_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_bot_settings()
+    support = settings["about_support_link"]
+    other_bot = settings["about_bot_link"]
+
+    lines = ["\u2139\ufe0f About"]
+    if support:
+        lines.append(f"\nSupport group: [(Link)]({support})")
+    if other_bot:
+        lines.append(f"\nAnother bot: [(Link)]({other_bot})")
+    if not support and not other_bot:
+        lines.append("\n(Not set yet — the owner can set these with /aboutset.)")
+
+    buttons = [[InlineKeyboardButton("\u2039 back", callback_data="menu_startup")]]
+    await q.edit_message_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown", disable_web_page_preview=True,
+    )
+
+
+async def cmd_aboutset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Send the Support Group link. /cancel to stop."
+    )
+    return AWAITING_ABOUT_SUPPORT_LINK
+
+
+async def receive_about_support_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    link = update.message.text.strip()
+    if not (link.startswith("http://") or link.startswith("https://") or link.startswith("https://t.me/")):
+        await update.message.reply_text(
+            "\u26a0\ufe0f Send a full link starting with http:// or https://. Or /cancel."
+        )
+        return AWAITING_ABOUT_SUPPORT_LINK
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.update_bot_settings(about_support_link=link)
+    await update.message.reply_text("\u2705 Support group link saved.\n\nNow send the Another Bot link. /cancel to stop.")
+    return AWAITING_ABOUT_BOT_LINK
+
+
+async def receive_about_bot_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    link = update.message.text.strip()
+    if not (link.startswith("http://") or link.startswith("https://")):
+        await update.message.reply_text(
+            "\u26a0\ufe0f Send a full link starting with http:// or https://. Or /cancel."
+        )
+        return AWAITING_ABOUT_BOT_LINK
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.update_bot_settings(about_bot_link=link)
+    await update.message.reply_text("\u2705 Another-bot link saved. Both links are set.")
+    return ConversationHandler.END
+
+
+async def cancel_aboutset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
 async def cb_stub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("Coming soon.", show_alert=True)
 
@@ -620,6 +695,7 @@ def register(application: Application):
     command and calls startup_menu() directly for the plain-/start case."""
     application.add_handler(CallbackQueryHandler(cb_startup, pattern=r"^menu_startup$"))
     application.add_handler(CallbackQueryHandler(cb_help, pattern=r"^menu_help$"))
+    application.add_handler(CallbackQueryHandler(cb_about, pattern=r"^menu_about$"))
     application.add_handler(CallbackQueryHandler(cb_manage_clones, pattern=r"^menu_manage_clones$"))
     application.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^menu_settings$"))
     application.add_handler(CallbackQueryHandler(cb_settings_protect_toggle, pattern=r"^settings_protect_toggle$"))
@@ -671,3 +747,17 @@ def register(application: Application):
         fallbacks=[CommandHandler("cancel", cancel_settings_input)],
     )
     application.add_handler(settings_input_conv)
+
+    aboutset_conv = ConversationHandler(
+        entry_points=[CommandHandler("aboutset", cmd_aboutset)],
+        states={
+            AWAITING_ABOUT_SUPPORT_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_support_link),
+            ],
+            AWAITING_ABOUT_BOT_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_bot_link),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_aboutset)],
+    )
+    application.add_handler(aboutset_conv)
