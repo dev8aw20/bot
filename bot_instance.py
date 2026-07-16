@@ -72,7 +72,26 @@ UPDATE_CHANNEL_URL = os.environ.get("UPDATE_CHANNEL_URL", "").strip()
 # Same BOT_USERNAME env var bot.py (the master) requires for itself — one
 # process, one env, so it's already set. Used to build a deep link back to
 # the master bot from inside a clone (see _continue_after_gates below).
+# Read here only as a startup fallback: a hand-typed env var is one typo
+# away from pointing at a username that doesn't exist (e.g. a stray/missing
+# underscore), which would silently break every such deep link and show
+# "Bot not found" when tapped. bot.py's post_init verifies the real
+# username via get_me() once at startup and calls set_master_bot_username()
+# below to correct this value in place — so by the time any clone actually
+# serves traffic, this holds the real username regardless of what the env
+# var said.
 MASTER_BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
+
+
+def set_master_bot_username(username: str) -> None:
+    """Called once from bot.py's post_init with the Telegram-verified
+    username (from application.bot.get_me()). Overrides the env-var-based
+    default above for every clone in this process — clones read
+    MASTER_BOT_USERNAME as a plain module global, not a constant captured
+    at import time, so this takes effect immediately for all of them."""
+    global MASTER_BOT_USERNAME
+    if username:
+        MASTER_BOT_USERNAME = username.strip().lstrip("@")
 
 EPISODE_EXTRACT_PATTERNS = [
     re.compile(r'(?:episode|ep)\.?\s*#?\s*(\d+)', re.IGNORECASE),

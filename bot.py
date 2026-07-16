@@ -35,6 +35,7 @@ from db import Database
 import master_menu
 import clone_features
 from clone_runner import CloneRunner
+import bot_instance
 from bot_instance import BotInstance
 
 logging.basicConfig(
@@ -1621,6 +1622,26 @@ async def post_init(application: Application):
     await db.connect()
     await db.init_schema()
     logger.info("Database connected and schema ready.")
+
+    # BOT_USERNAME (env var) is hand-typed and easy to get wrong — a
+    # missing/stray underscore silently breaks every deep link built from
+    # it (t.me/<BOT_USERNAME>/..., and every clone's "Master Bot: @..."
+    # line in ABOUT) with a "Bot not found" that's hard to trace back to
+    # this. Verify it against Telegram itself once here and correct it —
+    # for this process (BOT_USERNAME below) and for every clone
+    # (bot_instance.set_master_bot_username, since clones run in their own
+    # Application instances and can't see this one's bot_data).
+    global BOT_USERNAME
+    me = await application.bot.get_me()
+    if me.username and me.username != BOT_USERNAME:
+        logger.warning(
+            "BOT_USERNAME env var (%r) doesn't match this bot's real "
+            "Telegram username (%r) — using the real one for all deep "
+            "links and clone ABOUT pages.",
+            BOT_USERNAME, me.username,
+        )
+        BOT_USERNAME = me.username
+    bot_instance.set_master_bot_username(BOT_USERNAME)
 
     application.bot_data["central_db"] = central_db
     application.bot_data["runner"] = clone_runner
