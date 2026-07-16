@@ -54,8 +54,8 @@ DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
 # Defaults for the ABOUT menu's two links — optional at deploy time.
 # /aboutset (below) lets the owner override either one from inside
 # Telegram without touching env vars; whichever bot_settings has wins.
-DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("UPDATE_SUPPORT_GROUP", "").strip()
-DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
+DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("SUPPORT_GROUP_LINK", "").strip()
+DEFAULT_ANOTHER_BOT_LINK = os.environ.get("ANOTHER_BOT_LINK", "").strip()
 
 WAITING_FOR_TOKEN = 1
 WAITING_FOR_SUPABASE_URL = 2
@@ -602,6 +602,7 @@ async def cb_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_aboutset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("\u26d4 Only the bot owner can use /aboutset.")
         return ConversationHandler.END
     await update.message.reply_text(
         "Send an extra link to add to the ABOUT page, as \"Label - URL\" "
