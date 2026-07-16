@@ -80,6 +80,31 @@ EPISODE_EXTRACT_PATTERNS = [
     re.compile(r'(\d+)'),
 ]
 
+# Same two env vars master_menu.py reads for its own ABOUT page — reused
+# here verbatim so the clone's ABOUT shows the same platform support/about
+# links as the master bot, not a separately-invented one.
+DEFAULT_SUPPORT_GROUP_LINK = os.environ.get("UPDATE_SUPPORT_GROUP", "").strip()
+DEFAULT_ANOTHER_BOT_LINK = os.environ.get("OTHER_BOT_URL", "").strip()
+
+
+def _parse_about_extra_links(raw):
+    """Same parsing as master_menu.py's _parse_about_extra_links — reads
+    the SAME central bot_settings.about_extra_links row (there's only one,
+    set by the master bot owner via /aboutset), so any extra link the
+    owner adds there shows up on every clone's ABOUT too."""
+    if not raw or not raw.strip():
+        return []
+    out = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or " - " not in line:
+            continue
+        label, url = line.rsplit(" - ", 1)
+        label, url = label.strip(), url.strip()
+        if label and url:
+            out.append((label, url))
+    return out
+
 
 def _human_file_size(num_bytes):
     if not num_bytes:
@@ -181,7 +206,6 @@ class BotInstance:
         self.force_join_pending_channel_id: str | None = None
         self.force_join_pending_title: str | None = None
         self.awaiting_force_join_edit_channel_id: str | None = None
-        self.awaiting_about_text: bool = False
         self.cancelled_deliveries: set[tuple[int, int]] = set()
         # Per-folder asyncio.Lock so concurrent audio posts to the same
         # source channel don't race on batch total_links/page rendering.
@@ -200,7 +224,6 @@ class BotInstance:
         self.force_join_pending_channel_id = None
         self.force_join_pending_title = None
         self.awaiting_force_join_edit_channel_id = None
-        self.awaiting_about_text = False
 
     # ── /start (converted from cmd_start in bot.py) ─────────────────────
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -280,10 +303,13 @@ class BotInstance:
         query = update.callback_query
         await query.answer()
         text = (
+            f"\U0001F435 Help Menu\n\n"
             f"\u2139\ufe0f *This Bot:* @{self.bot_username}\n"
             + (f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}\n" if MASTER_BOT_USERNAME else "")
             + "\n"
-            "Send me a shared link to get your files.\n"
+            "I am a permanent file store bot. Send me a shared link to get "
+            "your files.\n\n"
+            "Available Commands: /start\n"
             "If the bot asks you to join a channel first, join it and "
             "press \u201cTry Again\u201d, then send the link again."
         )
@@ -298,16 +324,27 @@ class BotInstance:
     async def cb_about(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        settings = await self.central_db.get_clone_settings(self.clone_id)
-        about_body = settings.get("about_text") or "No about info has been set for this bot yet."
-        text = (
-            f"\U0001F4DC *This Bot:* @{self.bot_username}\n"
-            + (f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}\n" if MASTER_BOT_USERNAME else "")
-            + f"\n{about_body}"
-        )
+        # ABOUT reuses the master bot's own about content (support group,
+        # other-bot link, owner-managed extra links via /aboutset on the
+        # master) instead of a separate per-clone text — same source of
+        # truth as master_menu.py's cb_about, just with this clone's own
+        # name (and the master's) prefixed on top.
+        settings = await self.central_db.get_bot_settings()
+
+        lines = [f"\u2139\ufe0f *This Bot:* @{self.bot_username}"]
+        if MASTER_BOT_USERNAME:
+            lines.append(f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}")
+        if DEFAULT_SUPPORT_GROUP_LINK:
+            lines.append(f"\nSupport group: [(Link)]({DEFAULT_SUPPORT_GROUP_LINK})")
+        if DEFAULT_ANOTHER_BOT_LINK:
+            lines.append(f"\nAnother bot: [(Link)]({DEFAULT_ANOTHER_BOT_LINK})")
+        for label, url in _parse_about_extra_links(settings["about_extra_links"]):
+            lines.append(f"\n{label}: [(Link)]({url})")
+
         await query.edit_message_text(
-            text,
+            "\n".join(lines),
             parse_mode="Markdown",
+            disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("\u2039 back", callback_data="start_back")]]
             ),
@@ -324,21 +361,6 @@ class BotInstance:
             "of this bot for one."
         )
         await query.edit_message_text(text, reply_markup=self._start_menu_markup())
-
-    # ── /setabout (owner-only: saves the text shown by the ABOUT button) ─
-    async def cmd_setabout(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != self.owner_id:
-            return
-        if ctx.args:
-            about_text = update.effective_message.text.split(None, 1)[1].strip()
-            await self.central_db.update_clone_settings(self.clone_id, about_text=about_text)
-            await update.effective_message.reply_text("\u2705 About text saved.")
-            return
-        self.awaiting_about_text = True
-        await update.effective_message.reply_text(
-            "\U0001F4DD Send the text you want shown on the ABOUT button.\n\n"
-            "(Or use /setabout <text> directly next time.)"
-        )
 
 
     # ── Force-join gate (converted from _has_join_request / _is_member /
@@ -1156,15 +1178,6 @@ class BotInstance:
             return
         text = (update.message.text or "").strip()
 
-        if self.awaiting_about_text:
-            self.awaiting_about_text = False
-            if not text:
-                await update.message.reply_text("\u26a0\ufe0f About text cannot be empty. Try /setabout again.")
-                return
-            await self.central_db.update_clone_settings(self.clone_id, about_text=text)
-            await update.message.reply_text("\u2705 About text saved.")
-            return
-
         if self.awaiting_rename_folder_id is not None:
             folder_id = self.awaiting_rename_folder_id
             if not text:
@@ -1411,7 +1424,6 @@ class BotInstance:
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("folders", self.cmd_folders))
         app.add_handler(CommandHandler("forcejoin", self.cmd_forcejoin))
-        app.add_handler(CommandHandler("setabout", self.cmd_setabout))
         app.add_handler(CallbackQueryHandler(self.cb_help, pattern=r"^start_help$"))
         app.add_handler(CallbackQueryHandler(self.cb_about, pattern=r"^start_about$"))
         app.add_handler(CallbackQueryHandler(self.cb_start_back, pattern=r"^start_back$"))
