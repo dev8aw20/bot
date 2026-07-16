@@ -60,7 +60,7 @@ BATCH_MAX = 50
 PAGE_SIZE = 20  # max inline buttons per channel message
 FORCE_JOIN_LIMIT = 6  # cap on how many channels a clone owner can force-join to
 DEFAULT_AUTO_DELETE_MSG = (
-    "\u26a0\ufe0 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 {[minutes]} 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
+    "\u26a0\ufe0f 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 {[minutes]} 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
 )  # kept in sync with clone_features.py's copy — shown when the owner hasn't set a custom one
 
 # Same env var bot.py uses for the master's "UPDATE CHANNEL" button — shared
@@ -79,6 +79,64 @@ EPISODE_EXTRACT_PATTERNS = [
     re.compile(r'#\s*(\d+)'),
     re.compile(r'(\d+)'),
 ]
+
+
+def _human_file_size(num_bytes):
+    if not num_bytes:
+        return ""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _render_caption(template, audio_row: dict):
+    """Fills {file_name}/{file_size}/{caption} from this clone's own
+    CUSTOM CAPTION setting (clone_settings.custom_caption). None if no
+    template is set (Telegram then keeps the file with no caption, same
+    as today's default). Kept as its own copy rather than imported from
+    bot.py — bot_instance.py has no dependency on bot.py's internals
+    (see module docstring)."""
+    if not template:
+        return None
+    values = {
+        "file_name": audio_row.get("file_name") or "",
+        "file_size": _human_file_size(audio_row.get("file_size")),
+        "caption": audio_row.get("caption") or "",
+    }
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError):
+        # Unknown {placeholder} in a saved template — send as-is rather
+        # than fail every delivery over one bad caption.
+        return template
+
+
+def _parse_custom_buttons(raw):
+    """This clone's own CUSTOM BUTTON setting (clone_settings.custom_buttons):
+    one row per line, buttons on a row separated by '|', each button
+    'Label - URL'. Malformed lines/buttons are silently skipped, not
+    fatal — a typo in one line shouldn't break delivery of every file in
+    the batch."""
+    if not raw or not raw.strip():
+        return None
+    rows = []
+    for line in raw.strip().splitlines():
+        row = []
+        for chunk in line.split("|"):
+            chunk = chunk.strip()
+            if not chunk or " - " not in chunk:
+                continue
+            label, url = chunk.rsplit(" - ", 1)
+            label, url = label.strip(), url.strip()
+            if not label or not url:
+                continue
+            row.append(InlineKeyboardButton(label, url=url))
+        if row:
+            rows.append(row)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 class BotInstance:
@@ -123,6 +181,7 @@ class BotInstance:
         self.force_join_pending_channel_id: str | None = None
         self.force_join_pending_title: str | None = None
         self.awaiting_force_join_edit_channel_id: str | None = None
+        self.awaiting_about_text: bool = False
         self.cancelled_deliveries: set[tuple[int, int]] = set()
         # Per-folder asyncio.Lock so concurrent audio posts to the same
         # source channel don't race on batch total_links/page rendering.
@@ -141,6 +200,7 @@ class BotInstance:
         self.force_join_pending_channel_id = None
         self.force_join_pending_title = None
         self.awaiting_force_join_edit_channel_id = None
+        self.awaiting_about_text = False
 
     # ── /start (converted from cmd_start in bot.py) ─────────────────────
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -177,6 +237,24 @@ class BotInstance:
 
         await self._continue_after_gates(update, ctx, settings, args)
 
+    def _start_menu_markup(self) -> InlineKeyboardMarkup | None:
+        """Buttons shown under the /start message: HELP + ABOUT on one row,
+        UPDATE CHANNEL on its own row (only if UPDATE_CHANNEL_URL is set),
+        and the existing CREATE MY OWN CLONE row underneath. Also reused as
+        the "‹ back" target from cb_help / cb_about."""
+        rows = [[
+            InlineKeyboardButton("\u2139\ufe0f HELP", callback_data="start_help"),
+            InlineKeyboardButton("\U0001F4DC ABOUT", callback_data="start_about"),
+        ]]
+        if UPDATE_CHANNEL_URL:
+            rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
+        if MASTER_BOT_USERNAME:
+            rows.append([InlineKeyboardButton(
+                "CREATE MY OWN CLONE",
+                url=f"https://t.me/{MASTER_BOT_USERNAME}?start=settings",
+            )])
+        return InlineKeyboardMarkup(rows) if rows else None
+
     async def _continue_after_gates(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, settings: dict, args: list):
         """Whatever cmd_start does once the owner/private/force-join checks
         are done — factored out so cb_checkjoin can resume here after the
@@ -191,19 +269,77 @@ class BotInstance:
                 "Send me a shared link to get your files, or ask the owner "
                 "of this bot for one."
             )
-            markup = None
-            if MASTER_BOT_USERNAME:
-                markup = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(
-                        "CREATE MY OWN CLONE",
-                        url=f"https://t.me/{MASTER_BOT_USERNAME}?start=settings",
-                    )]]
-                )
-            await update.effective_message.reply_text(text, reply_markup=markup)
+            await update.effective_message.reply_text(text, reply_markup=self._start_menu_markup())
             return
 
         batch_id = int(args[0].replace("batch_", ""))
         await self._deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
+
+    # ── HELP / ABOUT (new: shown as buttons under /start) ────────────────
+    async def cb_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        text = (
+            f"\u2139\ufe0f *This Bot:* @{self.bot_username}\n"
+            + (f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}\n" if MASTER_BOT_USERNAME else "")
+            + "\n"
+            "Send me a shared link to get your files.\n"
+            "If the bot asks you to join a channel first, join it and "
+            "press \u201cTry Again\u201d, then send the link again."
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data="start_back")]]
+            ),
+        )
+
+    async def cb_about(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        about_body = settings.get("about_text") or "No about info has been set for this bot yet."
+        text = (
+            f"\U0001F4DC *This Bot:* @{self.bot_username}\n"
+            + (f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}\n" if MASTER_BOT_USERNAME else "")
+            + f"\n{about_body}"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data="start_back")]]
+            ),
+        )
+
+    async def cb_start_back(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        user = query.from_user
+        text = settings["start_msg"] or (
+            f"Hello {user.first_name} \u2728\n\n"
+            "Send me a shared link to get your files, or ask the owner "
+            "of this bot for one."
+        )
+        await query.edit_message_text(text, reply_markup=self._start_menu_markup())
+
+    # ── /setabout (owner-only: saves the text shown by the ABOUT button) ─
+    async def cmd_setabout(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        if ctx.args:
+            about_text = update.effective_message.text.split(None, 1)[1].strip()
+            await self.central_db.update_clone_settings(self.clone_id, about_text=about_text)
+            await update.effective_message.reply_text("\u2705 About text saved.")
+            return
+        self.awaiting_about_text = True
+        await update.effective_message.reply_text(
+            "\U0001F4DD Send the text you want shown on the ABOUT button.\n\n"
+            "(Or use /setabout <text> directly next time.)"
+        )
+
 
     # ── Force-join gate (converted from _has_join_request / _is_member /
     # _check_force_join / cb_checkjoin). Reads force_join_channels, which
@@ -313,6 +449,7 @@ class BotInstance:
         settings = await self.central_db.get_clone_settings(self.clone_id)
         auto_delete_on = settings["auto_delete_enabled"]
         auto_delete_minutes = settings["auto_delete_minutes"]
+        custom_markup = _parse_custom_buttons(settings["custom_buttons"])
 
         def _closing_text():
             hands = " ".join(["\U0001F590\ufe0f"] * 8)
@@ -338,7 +475,8 @@ class BotInstance:
         )
 
         audios = await self.db.fetch(
-            "SELECT id, telegram_file_id FROM audios WHERE batch_id = $1 ORDER BY id",
+            "SELECT id, telegram_file_id, file_name, file_size, caption "
+            "FROM audios WHERE batch_id = $1 ORDER BY id",
             batch_id
         )
         sent_ids = []
@@ -363,9 +501,17 @@ class BotInstance:
                 failed_audios.append(audio["id"])
                 continue
 
+            caption = _render_caption(settings["custom_caption"], audio)
+
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 try:
-                    msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
+                    msg = await ctx.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio["telegram_file_id"],
+                        caption=caption,
+                        protect_content=settings["no_forward_enabled"],
+                        reply_markup=custom_markup,
+                    )
                     break
                 except Exception as e:
                     logger.error(
@@ -1010,6 +1156,15 @@ class BotInstance:
             return
         text = (update.message.text or "").strip()
 
+        if self.awaiting_about_text:
+            self.awaiting_about_text = False
+            if not text:
+                await update.message.reply_text("\u26a0\ufe0f About text cannot be empty. Try /setabout again.")
+                return
+            await self.central_db.update_clone_settings(self.clone_id, about_text=text)
+            await update.message.reply_text("\u2705 About text saved.")
+            return
+
         if self.awaiting_rename_folder_id is not None:
             folder_id = self.awaiting_rename_folder_id
             if not text:
@@ -1244,11 +1399,22 @@ class BotInstance:
             Application.builder()
             .token(self.bot_token)
             .request(request)
+            # Without this, PTB processes this clone's updates one at a
+            # time — every user is queued behind whoever's _deliver_batch
+            # is currently running, and the Cancel button can't even be
+            # dequeued until delivery finishes. Matches bot.py's master
+            # setup; kept at 8 (not higher) to stay under
+            # connection_pool_size=8 above and db.py's per-clone pool size.
+            .concurrent_updates(8)
             .build()
         )
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("folders", self.cmd_folders))
         app.add_handler(CommandHandler("forcejoin", self.cmd_forcejoin))
+        app.add_handler(CommandHandler("setabout", self.cmd_setabout))
+        app.add_handler(CallbackQueryHandler(self.cb_help, pattern=r"^start_help$"))
+        app.add_handler(CallbackQueryHandler(self.cb_about, pattern=r"^start_about$"))
+        app.add_handler(CallbackQueryHandler(self.cb_start_back, pattern=r"^start_back$"))
         app.add_handler(CallbackQueryHandler(self.cb_folder_new, pattern=r"^folder_new$"))
         app.add_handler(CallbackQueryHandler(self.cb_folder_manage, pattern=r"^folder_manage_\d+$"))
         app.add_handler(CallbackQueryHandler(self.cb_folder_list, pattern=r"^folder_list$"))

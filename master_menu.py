@@ -546,6 +546,7 @@ async def cb_clone_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return InlineKeyboardButton(label, callback_data=cd)
     buttons = [
         [b("START MSG", f"csm_menu_{clone_id}"), b("FORCE SUB", f"fsub_menu_{clone_id}")],
+        [b("CUSTOM CAPTION", f"ccap_menu_{clone_id}"), b("CUSTOM BUTTON", f"cbtn_menu_{clone_id}")],
         [b("MODERATORS", f"mod_menu_{clone_id}"), b("AUTO DELETE", f"ad_menu_{clone_id}")],
         [b("NO FORWARD", f"nofwd_menu_{clone_id}"), b("ACCESS TOKEN", f"atok_menu_{clone_id}")],
         [b("TRANSFER DB", f"tdb_menu_{clone_id}"), b("ACTIVATE" if not clone["is_active"] else "DEACTIVATE",

@@ -40,6 +40,44 @@ DEFAULT_AUTO_DELETE_MSG = (
     "\u26a0\ufe0f These files will self-destruct in {minutes} minutes."
 )
 
+# ── CUSTOM CAPTION / CUSTOM BUTTON ───────────────────────────────────────
+# Per-clone versions of the master bot's Settings > CUSTOM CAPTION / CUSTOM
+# BUTTON menu (see master_menu.py) — stored in clone_settings.custom_caption
+# / custom_buttons instead of the master's singleton bot_settings row, and
+# rendered per audio by bot_instance.py's own _render_caption /
+# _parse_custom_buttons (kept as separate copies there, same reasoning as
+# this file's ownership-check docstring: no cross-file dependency).
+CUSTOM_CAPTION_HELP = (
+    "Custom Caption: add a custom caption to your media messages instead "
+    "of the original caption.\n\n"
+    "Fillings:\n"
+    "\u2022 {file_name}: File Name\n"
+    "\u2022 {file_size}: File size\n"
+    "\u2022 {caption}: Original Caption"
+)
+
+
+def _preview_button_markup(raw: str):
+    """Same parsing as bot_instance.py's _parse_custom_buttons, but
+    returns plain button rows (for embedding in a bigger keyboard here)
+    rather than an InlineKeyboardMarkup."""
+    if not raw or not raw.strip():
+        return None
+    rows = []
+    for line in raw.strip().splitlines():
+        row = []
+        for chunk in line.split("|"):
+            chunk = chunk.strip()
+            if not chunk or " - " not in chunk:
+                continue
+            label, url = chunk.rsplit(" - ", 1)
+            label, url = label.strip(), url.strip()
+            if label and url:
+                row.append(InlineKeyboardButton(f"{label} \u2197\ufe0f", url=url))
+        if row:
+            rows.append(row)
+    return rows or None
+
 
 async def _get_owned_clone(update: Update, ctx: ContextTypes.DEFAULT_TYPE, clone_id: int):
     """Fetch a clone and verify the callback sender actually owns it.
@@ -96,6 +134,7 @@ async def cb_startmsg_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_clone_settings(clone_id)
+    current = settings["start_msg"] or f"{DEFAULT_START_MSG} (default — not set)"
     await q.answer()
     await q.message.reply_text(
         current,
@@ -114,6 +153,112 @@ async def cb_startmsg_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await central_db.update_clone_settings(clone_id, start_msg=None)
     await q.answer("Reset to default.")
     await cb_startmsg_menu(update, ctx)
+
+
+# ── CUSTOM CAPTION ────────────────────────────────────────────────────────
+async def cb_customcaption_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return
+    buttons = [
+        [InlineKeyboardButton("Edit", callback_data=f"ccap_edit_{clone_id}"),
+         InlineKeyboardButton("See", callback_data=f"ccap_see_{clone_id}")],
+        [InlineKeyboardButton("Delete", callback_data=f"ccap_delete_{clone_id}")],
+        [InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")],
+    ]
+    await q.edit_message_text(CUSTOM_CAPTION_HELP, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def cb_customcaption_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return ConversationHandler.END
+    ctx.user_data["editing"] = ("custom_caption", clone_id)
+    await q.edit_message_text(
+        "Send the new caption template. You can use {file_name}, "
+        "{file_size}, {caption}. /cancel to stop."
+    )
+    return AWAITING_INPUT
+
+
+async def cb_customcaption_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_clone_settings(clone_id)
+    current = settings["custom_caption"] or "(not set — original captions are used as-is)"
+    await q.answer()
+    await q.message.reply_text(
+        current,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"ccap_menu_{clone_id}")]]
+        ),
+    )
+
+
+async def cb_customcaption_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.update_clone_settings(clone_id, custom_caption=None)
+    await q.answer("Deleted.")
+    await cb_customcaption_menu(update, ctx)
+
+
+# ── CUSTOM BUTTON ─────────────────────────────────────────────────────────
+async def cb_custombutton_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_clone_settings(clone_id)
+    preview_rows = _preview_button_markup(settings["custom_buttons"]) or []
+
+    rows = list(preview_rows)
+    rows.append([InlineKeyboardButton("\u2795", callback_data=f"cbtn_add_{clone_id}")])
+    rows.append([InlineKeyboardButton("Delete", callback_data=f"cbtn_delete_{clone_id}")])
+    rows.append([InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")])
+
+    text = "Custom Button: add a custom button to your media messages"
+    if not preview_rows:
+        text += "\n\n(none set yet)"
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_custombutton_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return ConversationHandler.END
+    ctx.user_data["editing"] = ("custom_button_add", clone_id)
+    await q.edit_message_text(
+        "Send a new button row: \"Label - URL\", or two on the same row "
+        "with \"Label1 - URL1 | Label2 - URL2\". This is ADDED as a new "
+        "row below your existing buttons. /cancel to stop."
+    )
+    return AWAITING_INPUT
+
+
+async def cb_custombutton_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    clone_id = _clone_id_from(q.data)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.update_clone_settings(clone_id, custom_buttons=None)
+    await q.answer("Deleted.")
+    await cb_custombutton_menu(update, ctx)
 
 
 # ── FORCE SUB ─────────────────────────────────────────────────────────────
@@ -732,6 +877,36 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
 
+    if field == "custom_caption":
+        await central_db.update_clone_settings(clone_id, custom_caption=text)
+        await update.message.reply_text(
+            "\u2705 Custom caption updated.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"ccap_menu_{clone_id}")]]
+            ),
+        )
+        ctx.user_data.pop("editing", None)
+        return ConversationHandler.END
+
+    if field == "custom_button_add":
+        if not _preview_button_markup(text):
+            await update.message.reply_text(
+                "\u26a0\ufe0f Couldn't parse that — use \"Label - URL\". Send again, or /cancel."
+            )
+            return AWAITING_INPUT
+        settings = await central_db.get_clone_settings(clone_id)
+        existing = settings["custom_buttons"] or ""
+        updated = (existing.rstrip() + "\n" + text).strip() if existing.strip() else text
+        await central_db.update_clone_settings(clone_id, custom_buttons=updated)
+        await update.message.reply_text(
+            "\u2705 Button row added.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"cbtn_menu_{clone_id}")]]
+            ),
+        )
+        ctx.user_data.pop("editing", None)
+        return ConversationHandler.END
+
     if field == "fsub_add_id":
         clone = await central_db.get_clone(clone_id)
         runner = ctx.application.bot_data["runner"]
@@ -874,6 +1049,13 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_startmsg_see, pattern=r"^csm_see_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_startmsg_default, pattern=r"^csm_default_\d+$"))
 
+    application.add_handler(CallbackQueryHandler(cb_customcaption_menu, pattern=r"^ccap_menu_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_customcaption_see, pattern=r"^ccap_see_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_customcaption_delete, pattern=r"^ccap_delete_\d+$"))
+
+    application.add_handler(CallbackQueryHandler(cb_custombutton_menu, pattern=r"^cbtn_menu_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_custombutton_delete, pattern=r"^cbtn_delete_\d+$"))
+
     application.add_handler(CallbackQueryHandler(cb_forcesub_menu, pattern=r"^fsub_menu_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_forcesub_remove, pattern=r"^fsub_remove_\d+_\d+$"))
 
@@ -904,6 +1086,8 @@ def register(application: Application):
     text_input_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(cb_startmsg_edit, pattern=r"^csm_edit_\d+$"),
+            CallbackQueryHandler(cb_customcaption_edit, pattern=r"^ccap_edit_\d+$"),
+            CallbackQueryHandler(cb_custombutton_add, pattern=r"^cbtn_add_\d+$"),
             CallbackQueryHandler(cb_forcesub_add, pattern=r"^fsub_add_\d+$"),
             CallbackQueryHandler(cb_moderators_add, pattern=r"^mod_add_\d+$"),
             CallbackQueryHandler(cb_autodelete_msg_edit, pattern=r"^ad_msg_edit_\d+$"),

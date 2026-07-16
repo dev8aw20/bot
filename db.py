@@ -289,8 +289,32 @@ class Database:
                 access_token TEXT,
                 auto_delete_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 auto_delete_minutes INTEGER NOT NULL DEFAULT 15,
-                auto_delete_message TEXT
+                auto_delete_message TEXT,
+                about_text TEXT,
+                custom_caption TEXT,
+                custom_buttons TEXT
             )
+        """)
+
+        # ADD COLUMN IF NOT EXISTS for clone_settings rows created before
+        # about_text existed — same reasoning as the bot_settings ALTERs
+        # above: CREATE TABLE IF NOT EXISTS is a no-op on an existing table.
+        await self.execute("""
+            ALTER TABLE clone_settings
+            ADD COLUMN IF NOT EXISTS about_text TEXT
+        """)
+
+        # Per-clone CUSTOM CAPTION / CUSTOM BUTTON (mirrors bot_settings'
+        # master-bot columns of the same name, but scoped per clone_id
+        # here). ADD COLUMN IF NOT EXISTS for clone_settings rows created
+        # before this migration.
+        await self.execute("""
+            ALTER TABLE clone_settings
+            ADD COLUMN IF NOT EXISTS custom_caption TEXT
+        """)
+        await self.execute("""
+            ALTER TABLE clone_settings
+            ADD COLUMN IF NOT EXISTS custom_buttons TEXT
         """)
 
         await self.execute("""
