@@ -559,9 +559,9 @@ async def cb_clone_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── ABOUT MENU ────────────────────────────────────────────────────────────
 # Support Group + Another Bot are FIXED — always the env-var defaults
-# (UPDATE_SUPPORT_GROUP, OTHER_BOT_URL), not owner-editable. /aboutset only
-# APPENDS extra links below those two, one "Label - URL" per /aboutset
-# call — same growable-list idiom as the CUSTOM BUTTON feature.
+# (UPDATE_SUPPORT_GROUP, OTHER_BOT_URL), not owner-editable. /aboutset
+# manages everything else: a growable, editable list of extra links shown
+# below those two — add, and now remove/update.
 def _parse_about_extra_links(raw):
     if not raw or not raw.strip():
         return []
@@ -575,6 +575,10 @@ def _parse_about_extra_links(raw):
         if label and url:
             out.append((label, url))
     return out
+
+
+def _about_extra_links_to_raw(links):
+    return "\n".join(f"{label} - {url}" for label, url in links) or None
 
 
 async def cb_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -600,15 +604,69 @@ async def cb_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _aboutset_menu_content(settings):
+    links = _parse_about_extra_links(settings["about_extra_links"])
+    lines = [
+        "\U0001F527 Manage ABOUT extra links.",
+        "(Support Group / Another Bot are fixed via env vars — not editable here.)",
+    ]
+    rows = []
+    if links:
+        lines.append("")
+        for i, (label, url) in enumerate(links):
+            lines.append(f"{i + 1}. {label} \u2192 {url}")
+            rows.append([InlineKeyboardButton(f"\u274c Remove \"{label}\"", callback_data=f"aboutset_remove_{i}")])
+    else:
+        lines.append("\n(No extra links yet.)")
+    rows.append([InlineKeyboardButton("\u2795 Add Link", callback_data="aboutset_add")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
 async def cmd_aboutset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("\u26d4 Only the bot owner can use /aboutset.")
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_bot_settings()
+    text, markup = _aboutset_menu_content(settings)
+    await update.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def cb_aboutset_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_bot_settings()
+    text, markup = _aboutset_menu_content(settings)
+    await q.edit_message_text(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def cb_aboutset_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
+    idx = int(q.data.replace("aboutset_remove_", ""))
+    central_db = ctx.application.bot_data["central_db"]
+    settings = await central_db.get_bot_settings()
+    links = _parse_about_extra_links(settings["about_extra_links"])
+    if 0 <= idx < len(links):
+        del links[idx]
+    await central_db.update_bot_settings(about_extra_links=_about_extra_links_to_raw(links))
+    await q.answer("Removed.")
+    await cb_aboutset_menu(update, ctx)
+
+
+async def cb_aboutset_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != OWNER_ID:
         return ConversationHandler.END
-    await update.message.reply_text(
-        "Send an extra link to add to the ABOUT page, as \"Label - URL\" "
-        "(e.g. \"Backup Channel - https://t.me/mychannel\"). This is ADDED "
-        "below Support Group / Another Bot, not a replacement for them. "
-        "/cancel to stop."
+    await q.edit_message_text(
+        "Send the new link as \"Label - URL\" (e.g. \"Backup Channel - "
+        "https://t.me/mychannel\"). /cancel to stop."
     )
     return AWAITING_ABOUT_EXTRA_LINK
 
@@ -625,7 +683,11 @@ async def receive_about_extra_link(update: Update, ctx: ContextTypes.DEFAULT_TYP
     existing = settings["about_extra_links"] or ""
     updated = (existing.rstrip() + "\n" + text).strip() if existing.strip() else text
     await central_db.update_bot_settings(about_extra_links=updated)
-    await update.message.reply_text("\u2705 Added to the ABOUT page.")
+    settings = await central_db.get_bot_settings()
+    menu_text, markup = _aboutset_menu_content(settings)
+    await update.message.reply_text(
+        f"\u2705 Added.\n\n{menu_text}", reply_markup=markup, disable_web_page_preview=True
+    )
     return ConversationHandler.END
 
 
@@ -730,6 +792,8 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_clone_delete_confirm, pattern=r"^clone_delete_confirm_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_clone_delete_go, pattern=r"^clone_delete_go_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_stub, pattern=r"^stub$"))
+    application.add_handler(CallbackQueryHandler(cb_aboutset_menu, pattern=r"^aboutset_menu$"))
+    application.add_handler(CallbackQueryHandler(cb_aboutset_remove, pattern=r"^aboutset_remove_\d+$"))
 
     add_clone_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_clone_add_start, pattern=r"^clone_add$")],
@@ -769,7 +833,7 @@ def register(application: Application):
     application.add_handler(settings_input_conv)
 
     aboutset_conv = ConversationHandler(
-        entry_points=[CommandHandler("aboutset", cmd_aboutset)],
+        entry_points=[CallbackQueryHandler(cb_aboutset_add, pattern=r"^aboutset_add$")],
         states={
             AWAITING_ABOUT_EXTRA_LINK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_about_extra_link),
@@ -777,4 +841,5 @@ def register(application: Application):
         },
         fallbacks=[CommandHandler("cancel", cancel_aboutset)],
     )
+    application.add_handler(CommandHandler("aboutset", cmd_aboutset))
     application.add_handler(aboutset_conv)
