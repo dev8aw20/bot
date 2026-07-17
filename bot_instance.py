@@ -39,6 +39,7 @@ be checked.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -343,8 +344,8 @@ class BotInstance:
         await query.answer()
         text = (
             f"\U0001F435 Help Menu\n\n"
-            f"\u2139\ufe0f *This Bot:* @{self.bot_username}\n"
-            + (f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}\n" if MASTER_BOT_USERNAME else "")
+            f"\u2139\ufe0f <b>This Bot:</b> @{html.escape(self.bot_username)}\n"
+            + (f"\U0001F916 <b>Master Bot:</b> @{html.escape(MASTER_BOT_USERNAME)}\n" if MASTER_BOT_USERNAME else "")
             + "\n"
             "I am a permanent file store bot. Send me a shared link to get "
             "your files.\n\n"
@@ -354,7 +355,7 @@ class BotInstance:
         )
         await query.edit_message_text(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("\u2039 back", callback_data="start_back")]]
             ),
@@ -370,19 +371,19 @@ class BotInstance:
         # name (and the master's) prefixed on top.
         settings = await self.central_db.get_bot_settings()
 
-        lines = [f"\u2139\ufe0f *This Bot:* @{self.bot_username}"]
+        lines = [f"\u2139\ufe0f <b>This Bot:</b> @{html.escape(self.bot_username)}"]
         if MASTER_BOT_USERNAME:
-            lines.append(f"\U0001F916 *Master Bot:* @{MASTER_BOT_USERNAME}")
+            lines.append(f"\U0001F916 <b>Master Bot:</b> @{html.escape(MASTER_BOT_USERNAME)}")
         if DEFAULT_SUPPORT_GROUP_LINK:
-            lines.append(f"\nSupport group: [(Link)]({DEFAULT_SUPPORT_GROUP_LINK})")
+            lines.append(f'\nSupport group: <a href="{html.escape(DEFAULT_SUPPORT_GROUP_LINK)}">(Link)</a>')
         if DEFAULT_ANOTHER_BOT_LINK:
-            lines.append(f"\nAnother bot: [(Link)]({DEFAULT_ANOTHER_BOT_LINK})")
+            lines.append(f'\nAnother bot: <a href="{html.escape(DEFAULT_ANOTHER_BOT_LINK)}">(Link)</a>')
         for label, url in _parse_about_extra_links(settings["about_extra_links"]):
-            lines.append(f"\n{label}: [(Link)]({url})")
+            lines.append(f'\n{html.escape(label)}: <a href="{html.escape(url)}">(Link)</a>')
 
         await query.edit_message_text(
             "\n".join(lines),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("\u2039 back", callback_data="start_back")]]
