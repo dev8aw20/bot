@@ -129,7 +129,7 @@ async def _manage_clones_content(ctx: ContextTypes.DEFAULT_TYPE, user_id: str, r
     buttons = [[InlineKeyboardButton("\u2795 Add Clone", callback_data="clone_add")]]
     for c in clones:
         status_emoji = "\u2705" if c["is_active"] else "\u274c"
-        label = f"{status_emoji} {c['bot_username'] or c['id']}"
+        label = f"{status_emoji} {c.get('bot_name') or c['bot_username'] or c['id']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"clone_dash_{c['id']}")])
     # Back target depends on WHO is looking, not how they navigated here —
     # Manage Clone's is the same screen for everyone, but menu_settings is
@@ -437,6 +437,7 @@ async def cb_clone_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_clone_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("pending_clone_token", None)
     ctx.user_data.pop("pending_clone_username", None)
+    ctx.user_data.pop("pending_clone_name", None)
     ctx.user_data.pop("pending_clone_supabase_url", None)
     await cb_manage_clones(update, ctx)
     return ConversationHandler.END
@@ -479,6 +480,7 @@ async def receive_clone_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # once, atomically, with everything required present.
     ctx.user_data["pending_clone_token"] = token
     ctx.user_data["pending_clone_username"] = me.username
+    ctx.user_data["pending_clone_name"] = me.first_name or me.username
 
     await update.message.reply_text(
         "\u2705 Token verified for @" + me.username + ".\n\n"
@@ -519,6 +521,7 @@ async def receive_supabase_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = ctx.user_data.get("pending_clone_supabase_url")
     token = ctx.user_data.get("pending_clone_token")
     username = ctx.user_data.get("pending_clone_username")
+    bot_name = ctx.user_data.get("pending_clone_name") or username
     if not (url and token and username):
         await update.message.reply_text(
             "Something went wrong tracking this setup — start over with /cancel then Add Clone."
@@ -551,6 +554,7 @@ async def receive_supabase_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if current >= MAX_CLONES_PER_USER:
         ctx.user_data.pop("pending_clone_token", None)
         ctx.user_data.pop("pending_clone_username", None)
+        ctx.user_data.pop("pending_clone_name", None)
         ctx.user_data.pop("pending_clone_supabase_url", None)
         await update.message.reply_text(
             f"\u26d4 You hit the {MAX_CLONES_PER_USER}-clone limit while this was being set up."
@@ -558,12 +562,13 @@ async def receive_supabase_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     clone_id = await central_db.create_clone(
-        user_id=user_id, bot_token=token, bot_username=username,
+        user_id=user_id, bot_token=token, bot_username=username, bot_name=bot_name,
         supabase_url=url, supabase_key=key,
         max_clones=MAX_CLONES_PER_USER,
     )
     ctx.user_data.pop("pending_clone_token", None)
     ctx.user_data.pop("pending_clone_username", None)
+    ctx.user_data.pop("pending_clone_name", None)
     ctx.user_data.pop("pending_clone_supabase_url", None)
 
     if clone_id is None:
@@ -575,7 +580,7 @@ async def receive_supabase_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone_row = await central_db.get_clone(clone_id)
     await runner.start_one(clone_row)
 
-    buttons = [[InlineKeyboardButton(f"\U0001FA84 {username}", callback_data=f"clone_dash_{clone_id}")],
+    buttons = [[InlineKeyboardButton(f"\U0001FA84 {bot_name}", callback_data=f"clone_dash_{clone_id}")],
                [InlineKeyboardButton("\u2039 back", callback_data="menu_manage_clones")]]
     await update.message.reply_text(
         f"\u2705 Clone @{username} created and started, using its own database.",
@@ -587,6 +592,7 @@ async def receive_supabase_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel_clone_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("pending_clone_token", None)
     ctx.user_data.pop("pending_clone_username", None)
+    ctx.user_data.pop("pending_clone_name", None)
     ctx.user_data.pop("pending_clone_supabase_url", None)
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END

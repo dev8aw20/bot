@@ -255,12 +255,25 @@ class Database:
                 supabase_url TEXT,
                 supabase_key TEXT,
                 bot_username TEXT,
+                bot_name TEXT,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 is_public BOOLEAN NOT NULL DEFAULT TRUE,
                 last_active_at TIMESTAMP DEFAULT NOW(),
                 created_at TIMESTAMP DEFAULT NOW(),
                 UNIQUE(bot_token_hash)
             )
+        """)
+
+        # bot_name (the bot's display/first name from getMe(), shown on
+        # buttons instead of bot_username) didn't exist before this — rows
+        # created earlier will have it NULL. Every read of bot_name falls
+        # back to bot_username in the caller, so this is safe to leave
+        # NULL rather than backfill (backfilling would need a live
+        # getMe() call per clone token, which needs network access this
+        # migration step doesn't have).
+        await self.execute("""
+            ALTER TABLE user_bots
+            ADD COLUMN IF NOT EXISTS bot_name TEXT
         """)
 
         await self.execute("""
@@ -419,6 +432,7 @@ class Database:
     async def create_clone(
         self, user_id: str, bot_token: str, bot_username: str,
         supabase_url: str, supabase_key: str,
+        bot_name: str = None,
         max_clones: int = 2,
     ) -> int | None:
         """Atomically enforce the per-user clone limit and insert.
@@ -460,19 +474,19 @@ class Database:
                 return await conn.fetchval("""
                     INSERT INTO user_bots
                         (user_id, bot_token, bot_token_hash, bot_username,
-                         supabase_url, supabase_key)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                         bot_name, supabase_url, supabase_key)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                     RETURNING id
                 """,
                     user_id, encrypt(bot_token), self._token_hash(bot_token),
-                    bot_username,
+                    bot_username, bot_name,
                     encrypt(supabase_url),
                     encrypt(supabase_key),
                 )
 
     async def list_clones(self, user_id: str) -> list:
         rows = await self.fetch(
-            "SELECT id, bot_username, is_active FROM user_bots "
+            "SELECT id, bot_username, bot_name, is_active FROM user_bots "
             "WHERE user_id = $1 ORDER BY created_at",
             user_id,
         )
@@ -498,7 +512,7 @@ class Database:
     async def get_clone(self, clone_id: int) -> dict | None:
         row = await self.fetchrow(
             "SELECT id, user_id, bot_token, supabase_url, supabase_key, "
-            "bot_username, is_active, is_public FROM user_bots WHERE id = $1",
+            "bot_username, bot_name, is_active, is_public FROM user_bots WHERE id = $1",
             clone_id,
         )
         if not row:
