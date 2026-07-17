@@ -135,14 +135,18 @@ async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status_emoji = "\u2705" if c["is_active"] else "\u274c"
         label = f"{status_emoji} {c['bot_username'] or c['id']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"clone_dash_{c['id']}")])
-    # Back goes to "menu_settings" (Settings \u2192 back \u2192 Help \u2192 back \u2192
-    # Startup), by explicit product decision. KNOWN TRADEOFF: menu_settings
-    # is owner-gated (see cb_settings) but Manage Clone's is reachable by
-    # any user directly from the startup menu's "CREATE MY OWN CLONE"
-    # button. A non-owner who lands here that way and taps back will hit
-    # cb_settings' "\u26d4 Only the bot owner can use Settings" gate and be
-    # stuck there (only a fresh /start recovers them). Accepted as-is.
-    buttons.append([InlineKeyboardButton("\u2039 back", callback_data="menu_settings")])
+    # Back target depends on WHO is looking, not how they navigated here —
+    # Manage Clone's is the same screen for everyone, but menu_settings is
+    # owner-gated (see cb_settings), so routing a non-owner's back button
+    # through it would just bounce them off "\u26d4 Only the bot owner can
+    # use Settings" with no way forward. So:
+    #   owner     -> menu_settings -> back -> menu_help -> back -> menu_startup
+    #   non-owner -> menu_help -> back -> menu_startup   (Settings skipped)
+    if q.from_user.id == OWNER_ID:
+        back_target = "menu_settings"
+    else:
+        back_target = "menu_help"
+    buttons.append([InlineKeyboardButton("\u2039 back", callback_data=back_target)])
 
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
