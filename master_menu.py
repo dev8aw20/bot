@@ -135,13 +135,16 @@ async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status_emoji = "\u2705" if c["is_active"] else "\u274c"
         label = f"{status_emoji} {c['bot_username'] or c['id']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"clone_dash_{c['id']}")])
-    # NOT "menu_settings" — that screen is owner-gated (see cb_settings),
-    # but Manage Clone's is open to every user (any user manages their own
-    # clones here, and can reach this screen straight from the startup
-    # menu's "CREATE MY OWN CLONE" button without ever touching Settings).
-    # Routing back through an owner-only screen locked non-owners out of
-    # their own "back" button.
-    buttons.append([InlineKeyboardButton("\u2039 back", callback_data="menu_startup")])
+    # Two different screens can open Manage Clone's: the owner reaches it
+    # via Settings -> MY CLONE BOT, everyone else reaches it directly from
+    # the startup menu's CREATE MY OWN CLONE button (Settings is
+    # owner-gated, so non-owners never pass through it). One static "back"
+    # button can't point at two different parents, so pick per-viewer:
+    # owner backs into Settings (matching that nesting), everyone else
+    # backs into Startup — routing a non-owner through the owner-gated
+    # Settings screen just re-triggers the "only the bot owner" alert.
+    back_target = "menu_settings" if q.from_user.id == OWNER_ID else "menu_startup"
+    buttons.append([InlineKeyboardButton("\u2039 back", callback_data=back_target)])
 
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
