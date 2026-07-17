@@ -135,7 +135,13 @@ async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status_emoji = "\u2705" if c["is_active"] else "\u274c"
         label = f"{status_emoji} {c['bot_username'] or c['id']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"clone_dash_{c['id']}")])
-    buttons.append([InlineKeyboardButton("\u2039 back", callback_data="menu_settings")])
+    # NOT "menu_settings" — that screen is owner-gated (see cb_settings),
+    # but Manage Clone's is open to every user (any user manages their own
+    # clones here, and can reach this screen straight from the startup
+    # menu's "CREATE MY OWN CLONE" button without ever touching Settings).
+    # Routing back through an owner-only screen locked non-owners out of
+    # their own "back" button.
+    buttons.append([InlineKeyboardButton("\u2039 back", callback_data="menu_startup")])
 
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -828,6 +834,10 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_settings_caption_delete, pattern=r"^settings_caption_delete$"))
     application.add_handler(CallbackQueryHandler(cb_settings_button_menu, pattern=r"^settings_button_menu$"))
     application.add_handler(CallbackQueryHandler(cb_settings_button_delete, pattern=r"^settings_button_delete$"))
+    # /setting: direct command entry to the owner-only global Settings menu
+    # (send_settings_menu already gates to OWNER_ID and works from a plain
+    # message, no callback_query — see its docstring).
+    application.add_handler(CommandHandler("setting", send_settings_menu))
     application.add_handler(CallbackQueryHandler(cb_clone_dashboard, pattern=r"^clone_dash_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_clone_toggle, pattern=r"^clone_toggle_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_clone_restart, pattern=r"^clone_restart_\d+$"))
