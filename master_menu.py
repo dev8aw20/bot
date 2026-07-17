@@ -117,12 +117,8 @@ async def cb_startup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── MANAGE CLONE'S MENU ──────────────────────────────────────────────────
-async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def _manage_clones_content(ctx: ContextTypes.DEFAULT_TYPE, user_id: str, requester_id: int):
     central_db = ctx.application.bot_data["central_db"]
-    user_id = str(q.from_user.id)
-
     clones = await central_db.list_clones(user_id)
 
     text = (
@@ -142,13 +138,28 @@ async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # use Settings" with no way forward. So:
     #   owner     -> menu_settings -> back -> menu_help -> back -> menu_startup
     #   non-owner -> menu_help -> back -> menu_startup   (Settings skipped)
-    if q.from_user.id == OWNER_ID:
-        back_target = "menu_settings"
-    else:
-        back_target = "menu_help"
+    back_target = "menu_settings" if requester_id == OWNER_ID else "menu_help"
     buttons.append([InlineKeyboardButton("\u2039 back", callback_data=back_target)])
+    return text, InlineKeyboardMarkup(buttons)
 
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cb_manage_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    text, markup = await _manage_clones_content(ctx, str(q.from_user.id), q.from_user.id)
+    await q.edit_message_text(text, reply_markup=markup)
+
+
+async def send_manage_clones_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """For the plain-message case — a clone's 'CREATE MY OWN CLONE' button
+    deep-links here via /start manage_clones (see bot_instance.py), which
+    has no callback_query to edit. NOT owner-gated, unlike
+    send_settings_menu — Manage Clone's is open to every user, that's the
+    whole point of letting clone users create their own clones."""
+    user_id = str(update.effective_user.id)
+    text, markup = await _manage_clones_content(ctx, user_id, update.effective_user.id)
+    await update.effective_message.reply_text(text, reply_markup=markup)
+
 
 
 # ── SETTINGS MENU ─────────────────────────────────────────────────────────
@@ -176,9 +187,12 @@ async def _render_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """For the plain-message case — a clone's 'CREATE MY OWN CLONE' button
-    deep-links here via /start settings (see bot_instance.py's
-    _continue_after_gates), which has no callback_query to edit."""
+    """For the plain-message case — reached via the /setting command (see
+    register() below), which has no callback_query to edit. (Previously
+    also reached via a clone's 'CREATE MY OWN CLONE' deep-link with
+    /start settings — that button now deep-links to /start manage_clones
+    instead, see bot_instance.py, since Settings is owner-gated and
+    Manage Clone's isn't.)"""
     if update.effective_user.id != OWNER_ID:
         await update.effective_message.reply_text(
             "\u26d4 Only the bot owner can use Settings."

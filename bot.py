@@ -1205,7 +1205,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     if update.effective_user.id == OWNER_ID:
-        if not args or not args[0].startswith("batch_"):
+        passthrough_args = ("settings", "manage_clones")
+        if not args or (args[0] not in passthrough_args and not args[0].startswith("batch_")):
             await update.message.reply_text(
                 "👑 *Owner Panel*\n\n"
                 "Commands:\n"
@@ -1218,10 +1219,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if args and args[0] == "settings":
-        # Deep link from a clone bot's "CREATE MY OWN CLONE" button
-        # (t.me/<BOT_USERNAME>?start=settings) — jump straight to Settings
-        # instead of the generic startup menu.
+        # Reached via /setting command's message flow now, not the clone's
+        # button (see manage_clones below) — kept for anyone with an old
+        # link or bookmark.
         await master_menu.send_settings_menu(update, ctx)
+        return
+
+    if args and args[0] == "manage_clones":
+        # Deep link from a clone bot's "CREATE MY OWN CLONE" button
+        # (t.me/<BOT_USERNAME>?start=manage_clones) — jump straight to
+        # Manage Clone's. NOT routed through Settings: Settings is
+        # owner-gated but Manage Clone's must work for every clone user.
+        await master_menu.send_manage_clones_menu(update, ctx)
         return
 
     if not args or not args[0].startswith("batch_"):

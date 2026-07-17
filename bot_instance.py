@@ -313,7 +313,7 @@ class BotInstance:
         if MASTER_BOT_USERNAME:
             rows.append([InlineKeyboardButton(
                 "CREATE MY OWN CLONE",
-                url=f"https://t.me/{MASTER_BOT_USERNAME}?start=settings",
+                url=f"https://t.me/{MASTER_BOT_USERNAME}?start=manage_clones",
             )])
         return InlineKeyboardMarkup(rows) if rows else None
 
