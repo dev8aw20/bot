@@ -278,7 +278,12 @@ async def cb_folder_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYP
         await q.answer()
         await q.edit_message_text("❌ Folder not found.")
         return
-    await db.delete_folder_cascade(folder_id)
+    try:
+        await db.delete_folder_cascade(folder_id)
+    except Exception:
+        logger.exception("Failed to delete folder %s", folder_id)
+        await q.answer("❌ Delete failed — check logs.", show_alert=True)
+        return
     await q.answer("Deleted.")
     await _show_folder_management(update, ctx)
 
