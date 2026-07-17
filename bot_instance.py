@@ -309,13 +309,14 @@ class BotInstance:
             InlineKeyboardButton("\u2139\ufe0f HELP", callback_data="start_help"),
             InlineKeyboardButton("\U0001F4DC ABOUT", callback_data="start_about"),
         ]]
-        if UPDATE_CHANNEL_URL:
-            rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
         if MASTER_BOT_USERNAME:
             rows.append([InlineKeyboardButton(
                 "CREATE MY OWN CLONE",
                 url=f"https://t.me/{MASTER_BOT_USERNAME}?start=manage_clones",
             )])
+        if UPDATE_CHANNEL_URL:
+            rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
+       
         return InlineKeyboardMarkup(rows) if rows else None
 
     async def _continue_after_gates(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, settings: dict, args: list):
