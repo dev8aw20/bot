@@ -99,11 +99,13 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Available Commands: /start /settings\n"
         "Moderator Commands: /broadcast, /ban, /unban"
     )
-    buttons = [
-        [InlineKeyboardButton("SETTINGS", callback_data="menu_settings"),
-         InlineKeyboardButton("STATS", callback_data="menu_stats")],
-        [InlineKeyboardButton("BACK", callback_data="menu_startup")],
-    ]
+    buttons = []
+    if q.from_user.id == OWNER_ID:
+        buttons.append(
+            [InlineKeyboardButton("SETTINGS", callback_data="menu_settings"),
+             InlineKeyboardButton("STATS", callback_data="menu_stats")]
+        )
+    buttons.append([InlineKeyboardButton("BACK", callback_data="menu_startup")])
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -166,16 +168,29 @@ async def send_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """For the plain-message case — a clone's 'CREATE MY OWN CLONE' button
     deep-links here via /start settings (see bot_instance.py's
     _continue_after_gates), which has no callback_query to edit."""
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text(
+            "\u26d4 Only the bot owner can use Settings."
+        )
+        return
     text, markup = await _settings_menu_content(ctx)
     await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 async def cb_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("\u26d4 Only the bot owner can use Settings.", show_alert=True)
+        return
+    await q.answer()
     await _render_settings_menu(update, ctx)
 
 
 async def cb_settings_protect_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
     new_state = not settings["protect_content"]
@@ -196,7 +211,11 @@ CUSTOM_CAPTION_HELP = (
 
 
 async def cb_settings_caption_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
+    await q.answer()
     buttons = [
         [InlineKeyboardButton("Edit", callback_data="settings_caption_edit"),
          InlineKeyboardButton("See", callback_data="settings_caption_see")],
@@ -210,6 +229,9 @@ async def cb_settings_caption_menu(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 async def cb_settings_caption_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return ConversationHandler.END
     await q.answer()
     await q.edit_message_text(
         "Send the new caption template. You can use {file_name}, "
@@ -219,6 +241,8 @@ async def cb_settings_caption_edit(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 
 async def receive_custom_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
     central_db = ctx.application.bot_data["central_db"]
     await central_db.update_bot_settings(custom_caption=update.message.text)
     await update.message.reply_text(
@@ -232,6 +256,9 @@ async def receive_custom_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 async def cb_settings_caption_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
     await q.answer()
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
@@ -246,6 +273,9 @@ async def cb_settings_caption_see(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
 async def cb_settings_caption_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
     central_db = ctx.application.bot_data["central_db"]
     await central_db.update_bot_settings(custom_caption=None)
     await q.answer("Deleted.")
@@ -277,6 +307,9 @@ def _preview_button_markup(raw: str):
 
 async def cb_settings_button_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
     await q.answer()
     central_db = ctx.application.bot_data["central_db"]
     settings = await central_db.get_bot_settings()
@@ -295,6 +328,9 @@ async def cb_settings_button_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
 async def cb_settings_button_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return ConversationHandler.END
     await q.answer()
     await q.edit_message_text(
         "Send a new button row: \"Label - URL\", or two on the same row "
@@ -305,6 +341,8 @@ async def cb_settings_button_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 async def receive_custom_button_line(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return ConversationHandler.END
     central_db = ctx.application.bot_data["central_db"]
     text = update.message.text.strip()
     if not _preview_button_markup(text):
@@ -327,6 +365,9 @@ async def receive_custom_button_line(update: Update, ctx: ContextTypes.DEFAULT_T
 
 async def cb_settings_button_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not allowed.", show_alert=True)
+        return
     central_db = ctx.application.bot_data["central_db"]
     await central_db.update_bot_settings(custom_buttons=None)
     await q.answer("Deleted.")

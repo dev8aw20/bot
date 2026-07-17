@@ -225,6 +225,13 @@ class BotInstance:
         self.force_join_pending_channel_id: str | None = None
         self.force_join_pending_title: str | None = None
         self.awaiting_force_join_edit_channel_id: str | None = None
+        # Per-clone Settings menu (Custom Caption / Custom Button /
+        # Protect Content) — the clone-owner-facing equivalent of
+        # master_menu.py's owner-only Settings menu, but scoped to THIS
+        # clone's own clone_settings row instead of the master's singleton
+        # bot_settings row. See cb_settings_menu below.
+        self.awaiting_caption_text: bool = False
+        self.awaiting_button_line: bool = False
         self.cancelled_deliveries: set[tuple[int, int]] = set()
         # Per-folder asyncio.Lock so concurrent audio posts to the same
         # source channel don't race on batch total_links/page rendering.
@@ -243,6 +250,8 @@ class BotInstance:
         self.force_join_pending_channel_id = None
         self.force_join_pending_title = None
         self.awaiting_force_join_edit_channel_id = None
+        self.awaiting_caption_text = False
+        self.awaiting_button_line = False
 
     # ── /start (converted from cmd_start in bot.py) ─────────────────────
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -250,6 +259,16 @@ class BotInstance:
         settings = await self.central_db.get_clone_settings(self.clone_id)
         user = update.effective_user
         args = ctx.args
+
+        if user.id == self.owner_id:
+            # /start doubles as the owner's "cancel" out of any pending
+            # text-wizard (caption edit, button-line add, folder rename,
+            # etc.) — there's no separate /cancel command wired up in this
+            # codebase (see handle_owner_text: it's a single dispatcher on
+            # self.awaiting_* flags, not a ConversationHandler), so this is
+            # the only exit. Don't tell owners to send /cancel elsewhere;
+            # it isn't a registered command and would just be swallowed.
+            self._reset_owner_state()
 
         await self.db.execute(
             """INSERT INTO users (user_id) VALUES ($1)
@@ -261,9 +280,10 @@ class BotInstance:
             label = "the owner" if settings["hide_owner"] else f"owner of @{self.bot_username}"
             await update.effective_message.reply_text(
                 f"Welcome back, {label}.\n\nUse /folders to manage your folders.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("\U0001F4C1 Manage Folders", callback_data="folder_list")]]
-                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001F4C1 Manage Folders", callback_data="folder_list")],
+                    [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="cs_menu")],
+                ]),
             )
             return
 
@@ -380,6 +400,145 @@ class BotInstance:
             "of this bot for one."
         )
         await query.edit_message_text(text, reply_markup=self._start_menu_markup())
+
+    # ── SETTINGS (owner-only, THIS clone's own clone_settings row) ───────
+    # The clone-owner-facing equivalent of master_menu.py's Settings menu.
+    # That one edits the master bot's singleton bot_settings row and is
+    # gated to the MASTER bot's OWNER_ID — it must never be reachable from
+    # here. This one edits clone_settings WHERE clone_id = self.clone_id
+    # and is gated to self.owner_id, THIS clone's own owner. Mirrors the
+    # UI/UX of master_menu.py's screen but scoped per-clone, and uses the
+    # same handle_owner_text single-flag pattern as the folder/forcejoin
+    # flows above (no ConversationHandler — see module docstring).
+    async def cb_settings_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("\u26d4 Only the bot owner can use Settings.", show_alert=True)
+            return
+        await q.answer()
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        protect_label = (
+            "PROTECT CONTENT \u2611\ufe0f" if settings["no_forward_enabled"]
+            else "PROTECT CONTENT \u2610"
+        )
+        buttons = [
+            [InlineKeyboardButton("CUSTOM CAPTION \U0001F58A\ufe0f", callback_data="cs_caption_menu"),
+             InlineKeyboardButton("CUSTOM BUTTON \u2728", callback_data="cs_button_menu")],
+            [InlineKeyboardButton(protect_label, callback_data="cs_protect_toggle"),
+             InlineKeyboardButton("\u2039 back", callback_data="start_back")],
+        ]
+        await q.edit_message_text(
+            "\u2699\ufe0f Settings... Customize your bot's settings as your need",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def cb_settings_protect_toggle(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        new_state = not settings["no_forward_enabled"]
+        await self.central_db.update_clone_settings(self.clone_id, no_forward_enabled=new_state)
+        await q.answer("Enabled." if new_state else "Disabled.")
+        await self.cb_settings_menu(update, ctx)
+
+    async def cb_settings_caption_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await q.answer()
+        text = (
+            "Custom Caption: add a custom caption to your media messages "
+            "instead of its original caption.\n\n"
+            "Fillings:\n"
+            "\u2022 {file_name}: File Name\n"
+            "\u2022 {file_size}: File size\n"
+            "\u2022 {caption}: Original Caption"
+        )
+        buttons = [
+            [InlineKeyboardButton("Edit", callback_data="cs_caption_edit"),
+             InlineKeyboardButton("See", callback_data="cs_caption_see")],
+            [InlineKeyboardButton("Delete", callback_data="cs_caption_delete")],
+            [InlineKeyboardButton("\u2039 back", callback_data="cs_menu")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def cb_settings_caption_edit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await q.answer()
+        self.awaiting_caption_text = True
+        await q.edit_message_text(
+            "Send the new caption template. You can use {file_name}, "
+            "{file_size}, {caption}. Send /start to cancel."
+        )
+
+    async def cb_settings_caption_see(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await q.answer()
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        current = settings["custom_caption"] or "(not set — original captions are used as-is)"
+        await q.message.reply_text(
+            current,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data="cs_caption_menu")]]
+            ),
+        )
+
+    async def cb_settings_caption_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await self.central_db.update_clone_settings(self.clone_id, custom_caption=None)
+        await q.answer("Deleted.")
+        await self.cb_settings_caption_menu(update, ctx)
+
+    async def cb_settings_button_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await q.answer()
+        settings = await self.central_db.get_clone_settings(self.clone_id)
+        preview = _parse_custom_buttons(settings["custom_buttons"])
+        rows = list(preview.inline_keyboard) if preview else []
+        rows.append([InlineKeyboardButton("\u2795", callback_data="cs_button_add")])
+        rows.append([InlineKeyboardButton("Delete", callback_data="cs_button_delete")])
+        rows.append([InlineKeyboardButton("\u2039 back", callback_data="cs_menu")])
+        text = "Custom Button: add a custom button to your media messages"
+        if not preview:
+            text += "\n\n(none set yet)"
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+    async def cb_settings_button_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await q.answer()
+        self.awaiting_button_line = True
+        await q.edit_message_text(
+            "Send a new button row: \"Label - URL\", or two on the same row "
+            "with \"Label1 - URL1 | Label2 - URL2\". This is ADDED as a new "
+            "row below your existing buttons. Send /start to cancel."
+        )
+
+    async def cb_settings_button_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if q.from_user.id != self.owner_id:
+            await q.answer("Not allowed.", show_alert=True)
+            return
+        await self.central_db.update_clone_settings(self.clone_id, custom_buttons=None)
+        await q.answer("Deleted.")
+        await self.cb_settings_button_menu(update, ctx)
 
 
     # ── Force-join gate (converted from _has_join_request / _is_member /
@@ -1197,6 +1356,36 @@ class BotInstance:
             return
         text = (update.message.text or "").strip()
 
+        if self.awaiting_caption_text:
+            self.awaiting_caption_text = False
+            await self.central_db.update_clone_settings(self.clone_id, custom_caption=text)
+            await update.message.reply_text(
+                "\u2705 Custom caption updated.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data="cs_caption_menu")]]
+                ),
+            )
+            return
+
+        if self.awaiting_button_line:
+            if not _parse_custom_buttons(text):
+                await update.message.reply_text(
+                    "\u26a0\ufe0f Couldn't parse that — use \"Label - URL\". Send again, or /start to cancel."
+                )
+                return
+            self.awaiting_button_line = False
+            settings = await self.central_db.get_clone_settings(self.clone_id)
+            existing = settings["custom_buttons"] or ""
+            updated = (existing.rstrip() + "\n" + text).strip() if existing.strip() else text
+            await self.central_db.update_clone_settings(self.clone_id, custom_buttons=updated)
+            await update.message.reply_text(
+                "\u2705 Button row added.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data="cs_button_menu")]]
+                ),
+            )
+            return
+
         if self.awaiting_rename_folder_id is not None:
             folder_id = self.awaiting_rename_folder_id
             if not text:
@@ -1460,6 +1649,15 @@ class BotInstance:
         app.add_handler(CallbackQueryHandler(self.cb_forcejoin_add, pattern=r"^forcejoin_add$"))
         app.add_handler(CallbackQueryHandler(self.cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
         app.add_handler(CallbackQueryHandler(self.cb_forcejoin_editlink, pattern=r"^forcejoin_editlink_\d+$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_menu, pattern=r"^cs_menu$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_protect_toggle, pattern=r"^cs_protect_toggle$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_caption_menu, pattern=r"^cs_caption_menu$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_caption_edit, pattern=r"^cs_caption_edit$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_caption_see, pattern=r"^cs_caption_see$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_caption_delete, pattern=r"^cs_caption_delete$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_button_menu, pattern=r"^cs_button_menu$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_button_add, pattern=r"^cs_button_add$"))
+        app.add_handler(CallbackQueryHandler(self.cb_settings_button_delete, pattern=r"^cs_button_delete$"))
         app.add_handler(ChatJoinRequestHandler(self.cb_chat_join_request))
         # Must be registered before the text handler: both could in
         # principle match overlapping updates, and only the first matching
