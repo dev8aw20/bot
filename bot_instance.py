@@ -61,7 +61,7 @@ BATCH_MAX = 50
 PAGE_SIZE = 20  # max inline buttons per channel message
 FORCE_JOIN_LIMIT = 6  # cap on how many channels a clone owner can force-join to
 DEFAULT_AUTO_DELETE_MSG = (
-    "\u26a0\ufe0f 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 [{minutes}MINUTE] 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
+    "\u26a0\ufe0f 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 [{minutes} minutes] 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
 )  # kept in sync with clone_features.py's copy — shown when the owner hasn't set a custom one
 
 # Same env var bot.py uses for the master's "UPDATE CHANNEL" button — shared
