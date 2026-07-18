@@ -72,6 +72,83 @@ class Database:
                 await conn.execute("DELETE FROM folder_pages WHERE folder_id = $1", folder_id)
                 await conn.execute("DELETE FROM folders WHERE id = $1", folder_id)
 
+    async def rebalance_folder_batches(self, folder_id: int, folder_name: str, batch_max: int) -> list[int]:
+        """Re-sorts every audio in a folder by episode number (numeric ones
+        ascending; non-numeric ids — e.g. the song fallback identifiers —
+        keep their original upload order and sort after all numeric ones)
+        and repacks them into batches of batch_max, filling existing
+        batch ids in their oldest-to-newest order.
+
+        Batch ids/order are never changed, only which audios live in
+        which batch, so 'Batch N' labels stay correct. This means a
+        late-arriving episode (e.g. Ep3 turning up after Ep51 already
+        exists) slots into the right spot and pushes everything after it
+        forward, cascading into later batches — same as a paper folder
+        where Ep51 would spill into Batch 2 once Ep3 takes its rightful
+        place in Batch 1.
+
+        New batches are created only if there are literally more audios
+        than existing batches can hold. Returns the list of batch ids
+        that were touched, so the caller can re-render only those
+        channel pages instead of the whole folder."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """SELECT a.id, a.episode_no FROM audios a
+                       JOIN batches b ON b.id = a.batch_id
+                       WHERE b.folder_id = $1""",
+                    folder_id,
+                )
+                if not rows:
+                    return []
+
+                def sort_key(r):
+                    ep = r["episode_no"]
+                    if ep is not None and ep.lstrip("-").isdigit():
+                        return (0, int(ep), r["id"])
+                    return (1, 0, r["id"])
+
+                rows_sorted = sorted(rows, key=sort_key)
+
+                batch_rows = await conn.fetch(
+                    "SELECT id FROM batches WHERE folder_id = $1 ORDER BY id", folder_id
+                )
+                batch_ids = [r["id"] for r in batch_rows]
+
+                chunks = [
+                    rows_sorted[i:i + batch_max]
+                    for i in range(0, len(rows_sorted), batch_max)
+                ]
+
+                # Only happens if there are more audios than existing
+                # batches can hold — normally covered already because the
+                # caller creates a holding batch before calling this, but
+                # guarded here too in case a folder somehow has zero batches.
+                while len(chunks) > len(batch_ids):
+                    new_id = await conn.fetchval(
+                        "INSERT INTO batches (folder_id, total_links, name) "
+                        "VALUES ($1, 0, $2) RETURNING id",
+                        folder_id, f"{folder_name} — Batch {len(batch_ids) + 1}",
+                    )
+                    batch_ids.append(new_id)
+
+                touched = []
+                for idx, batch_id in enumerate(batch_ids):
+                    chunk = chunks[idx] if idx < len(chunks) else []
+                    if chunk:
+                        audio_ids = [r["id"] for r in chunk]
+                        await conn.execute(
+                            "UPDATE audios SET batch_id = $1 WHERE id = ANY($2::int[])",
+                            batch_id, audio_ids,
+                        )
+                    await conn.execute(
+                        "UPDATE batches SET total_links = $1 WHERE id = $2",
+                        len(chunk), batch_id,
+                    )
+                    touched.append(batch_id)
+
+                return touched
+
     async def init_schema(self):
         await self.execute("""
             CREATE TABLE IF NOT EXISTS folders (

@@ -1028,43 +1028,42 @@ async def _ingest_channel_audio(folder, telegram_file_id: str, message_id: str,
         )
         return
 
-    existing = await db.fetchrow(
-        "SELECT id, total_links FROM batches "
-        "WHERE folder_id = $1 AND total_links < $2 ORDER BY created_at DESC LIMIT 1",
-        folder_id, BATCH_MAX
+    # Attach the new row to whichever batch is currently last — this is
+    # just a holding spot. rebalance_folder_batches() below immediately
+    # re-sorts every audio in the folder by episode number and repacks
+    # ALL batches from scratch, so it doesn't matter where it starts:
+    # a late Ep3 will get moved out of here into Batch 1, and whatever
+    # Batch 1 pushes out (e.g. Ep51) cascades forward automatically.
+    holding_batch_id = await db.fetchval(
+        "SELECT id FROM batches WHERE folder_id = $1 ORDER BY id DESC LIMIT 1",
+        folder_id
+    )
+    if holding_batch_id is None:
+        holding_batch_id = await db.fetchval(
+            "INSERT INTO batches (folder_id, total_links, name) VALUES ($1, 0, $2) RETURNING id",
+            folder_id, f"{folder['name']} — Batch 1"
+        )
+
+    await db.execute(
+        "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id, "
+        "file_name, file_size, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        holding_batch_id, telegram_file_id, episode_no, message_id, file_name, file_size, caption
     )
 
-    if existing:
-        batch_id = existing["id"]
-        await db.execute(
-            "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id, "
-            "file_name, file_size, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            batch_id, telegram_file_id, episode_no, message_id, file_name, file_size, caption
-        )
-        await db.execute(
-            "UPDATE batches SET total_links = total_links + 1 WHERE id = $1", batch_id
-        )
-    else:
-        batch_count = await db.fetchval(
-            "SELECT COUNT(*) FROM batches WHERE folder_id = $1", folder_id
-        )
-        batch_name = f"{folder['name']} — Batch {batch_count + 1}"
-        batch_id = await db.fetchval(
-            "INSERT INTO batches (folder_id, total_links, name) VALUES ($1, $2, $3) RETURNING id",
-            folder_id, 1, batch_name
-        )
-        await db.execute(
-            "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id, "
-            "file_name, file_size, caption) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            batch_id, telegram_file_id, episode_no, message_id, file_name, file_size, caption
-        )
+    touched_batch_ids = await db.rebalance_folder_batches(folder_id, folder["name"], BATCH_MAX)
 
     if channel_id:
-        try:
-            page_index = await _page_index_for_batch(folder_id, batch_id)
-            await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
-        except Exception as e:
-            logger.error(f"Channel page render failed for folder {folder_id} after ingest: {e}")
+        page_indices = set()
+        for batch_id in touched_batch_ids:
+            try:
+                page_indices.add(await _page_index_for_batch(folder_id, batch_id))
+            except Exception as e:
+                logger.error(f"Could not resolve page index for batch {batch_id}: {e}")
+        for page_index in sorted(page_indices):
+            try:
+                await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
+            except Exception as e:
+                logger.error(f"Channel page render failed for folder {folder_id} page {page_index} after ingest: {e}")
 
 
 async def handle_channel_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1357,7 +1356,9 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
 
     audios = await db.fetch(
         "SELECT id, telegram_file_id, file_name, file_size, caption "
-        "FROM audios WHERE batch_id = $1 ORDER BY id",
+        "FROM audios WHERE batch_id = $1 "
+        "ORDER BY CASE WHEN episode_no ~ '^[0-9]+$' THEN 0 ELSE 1 END, "
+        "CASE WHEN episode_no ~ '^[0-9]+$' THEN episode_no::int END, id",
         batch_id
     )
     sent_ids = []

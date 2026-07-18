@@ -677,7 +677,9 @@ class BotInstance:
 
         audios = await self.db.fetch(
             "SELECT id, telegram_file_id, file_name, file_size, caption "
-            "FROM audios WHERE batch_id = $1 ORDER BY id",
+            "FROM audios WHERE batch_id = $1 "
+            "ORDER BY CASE WHEN episode_no ~ '^[0-9]+$' THEN 0 ELSE 1 END, "
+            "CASE WHEN episode_no ~ '^[0-9]+$' THEN episode_no::int END, id",
             batch_id
         )
         sent_ids = []
@@ -1193,41 +1195,42 @@ class BotInstance:
             )
             return
 
-        existing = await self.db.fetchrow(
-            "SELECT id, total_links FROM batches "
-            "WHERE folder_id = $1 AND total_links < $2 ORDER BY created_at DESC LIMIT 1",
-            folder_id, BATCH_MAX
+        # Attach the new row to whichever batch is currently last — this
+        # is just a holding spot. rebalance_folder_batches() below
+        # immediately re-sorts every audio in the folder by episode
+        # number and repacks ALL batches from scratch, so it doesn't
+        # matter where it starts: a late Ep3 will get moved out of here
+        # into Batch 1, and whatever Batch 1 pushes out (e.g. Ep51)
+        # cascades forward automatically.
+        holding_batch_id = await self.db.fetchval(
+            "SELECT id FROM batches WHERE folder_id = $1 ORDER BY id DESC LIMIT 1",
+            folder_id
+        )
+        if holding_batch_id is None:
+            holding_batch_id = await self.db.fetchval(
+                "INSERT INTO batches (folder_id, total_links, name) VALUES ($1, 0, $2) RETURNING id",
+                folder_id, f"{folder['name']} — Batch 1"
+            )
+
+        await self.db.execute(
+            "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id) VALUES ($1, $2, $3, $4)",
+            holding_batch_id, telegram_file_id, episode_no, message_id
         )
 
-        if existing:
-            batch_id = existing["id"]
-            await self.db.execute(
-                "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id) VALUES ($1, $2, $3, $4)",
-                batch_id, telegram_file_id, episode_no, message_id
-            )
-            await self.db.execute(
-                "UPDATE batches SET total_links = total_links + 1 WHERE id = $1", batch_id
-            )
-        else:
-            batch_count = await self.db.fetchval(
-                "SELECT COUNT(*) FROM batches WHERE folder_id = $1", folder_id
-            )
-            batch_name = f"{folder['name']} — Batch {batch_count + 1}"
-            batch_id = await self.db.fetchval(
-                "INSERT INTO batches (folder_id, total_links, name) VALUES ($1, $2, $3) RETURNING id",
-                folder_id, 1, batch_name
-            )
-            await self.db.execute(
-                "INSERT INTO audios (batch_id, telegram_file_id, episode_no, message_id) VALUES ($1, $2, $3, $4)",
-                batch_id, telegram_file_id, episode_no, message_id
-            )
+        touched_batch_ids = await self.db.rebalance_folder_batches(folder_id, folder["name"], BATCH_MAX)
 
         if channel_id:
-            try:
-                page_index = await self._page_index_for_batch(folder_id, batch_id)
-                await self.render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
-            except Exception as e:
-                logger.error("Channel page render failed for folder %s after ingest: %s", folder_id, e)
+            page_indices = set()
+            for batch_id in touched_batch_ids:
+                try:
+                    page_indices.add(await self._page_index_for_batch(folder_id, batch_id))
+                except Exception as e:
+                    logger.error("Could not resolve page index for batch %s: %s", batch_id, e)
+            for page_index in sorted(page_indices):
+                try:
+                    await self.render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
+                except Exception as e:
+                    logger.error("Channel page render failed for folder %s page %s after ingest: %s", folder_id, page_index, e)
 
     async def handle_channel_audio(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Fires on every audio posted in ANY channel this clone's bot is
