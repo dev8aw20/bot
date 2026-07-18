@@ -1647,6 +1647,8 @@ async def _setup_bot_commands(application: Application):
         BotCommand("broadcast", "Send a broadcast message"),
         BotCommand("refreshbuttons", "Refresh all channel buttons"),
         BotCommand("exitbroadcast", "Exit broadcast mode"),
+        BotCommand("setting", "setting use"),
+        BotCommand("aboutset", "about set kara bot"),
     ]
 
     try:
