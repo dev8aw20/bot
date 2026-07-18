@@ -61,7 +61,7 @@ BATCH_MAX = 50
 PAGE_SIZE = 20  # max inline buttons per channel message
 FORCE_JOIN_LIMIT = 6  # cap on how many channels a clone owner can force-join to
 DEFAULT_AUTO_DELETE_MSG = (
-    "\u26a0\ufe0f 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 {[minutes]} 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
+    "\u26a0\ufe0f 📂 𝙵𝙸𝙻𝙴𝚂 𝚆𝙸𝙻𝙻 𝙱𝙴 𝙳𝙴𝙻𝙴𝚃𝙴𝙳 𝙰𝙵𝚃𝙴𝚁 [{minutes} minutes] 𝙿𝙻𝙴𝙰𝚂𝙴 𝚂𝙰𝚅𝙴 𝚃𝙷𝙴𝙼 𝚂𝙾𝙼𝙴𝚆𝙷𝙴𝚁𝙴 𝚂𝙰𝙵𝙴 .."
 )  # kept in sync with clone_features.py's copy — shown when the owner hasn't set a custom one
 
 # Same env var bot.py uses for the master's "UPDATE CHANNEL" button — shared
@@ -309,13 +309,14 @@ class BotInstance:
             InlineKeyboardButton("\u2139\ufe0f HELP", callback_data="start_help"),
             InlineKeyboardButton("\U0001F4DC ABOUT", callback_data="start_about"),
         ]]
-        if UPDATE_CHANNEL_URL:
-            rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
         if MASTER_BOT_USERNAME:
             rows.append([InlineKeyboardButton(
                 "CREATE MY OWN CLONE",
                 url=f"https://t.me/{MASTER_BOT_USERNAME}?start=manage_clones",
             )])
+        if UPDATE_CHANNEL_URL:
+            rows.append([InlineKeyboardButton("\U0001F4DF UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
+       
         return InlineKeyboardMarkup(rows) if rows else None
 
     async def _continue_after_gates(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, settings: dict, args: list):
