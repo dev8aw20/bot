@@ -991,6 +991,23 @@ def _extract_episode_no(text: str) -> str | None:
     return None
 
 
+def _fallback_name_identifier(file_name: str | None, title: str | None) -> str | None:
+    """For songs — filenames with no episode number in them at all. Builds
+    an identifier like "A_Aashiqui_2_mp3" from the first letter of the
+    name plus the full (sanitized) name, so two different songs starting
+    with the same letter don't collide as "duplicates" the way a bare
+    first-letter identifier would."""
+    name = file_name or title
+    if not name:
+        return None
+    safe = re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
+    if not safe:
+        return None
+    first_letter_match = re.search(r'[A-Za-z]', name)
+    first_letter = first_letter_match.group(0).upper() if first_letter_match else "#"
+    return f"{first_letter}_{safe}"[:200]
+
+
 async def _ingest_channel_audio(folder, telegram_file_id: str, message_id: str,
                                  episode_no: str, ctx: ContextTypes.DEFAULT_TYPE,
                                  file_name: str = None, file_size: int = None,
@@ -1065,8 +1082,20 @@ async def handle_channel_audio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not folder:
         return
 
-    source_text = message.caption or message.audio.file_name or message.audio.title or ""
-    episode_no = _extract_episode_no(source_text)
+    # Caption is deliberately NOT used for episode-number extraction —
+    # only filename and title.
+    episode_no = None
+    for source_text in (message.audio.file_name, message.audio.title):
+        episode_no = _extract_episode_no(source_text or "")
+        if episode_no is not None:
+            break
+
+    # Songs typically have no number anywhere in filename/title at all
+    # (unlike episodes) — fall back to a first-letter + full-name
+    # identifier instead of rejecting them.
+    if episode_no is None:
+        episode_no = _fallback_name_identifier(message.audio.file_name, message.audio.title)
+
     if episode_no is None:
         logger.warning(
             f"Could not extract an episode number for message {message.message_id} "

@@ -1159,6 +1159,22 @@ class BotInstance:
                 return str(int(m.group(1)))
         return None
 
+    def _fallback_name_identifier(self, file_name: str | None, title: str | None) -> str | None:
+        """For songs — filenames with no episode number in them at all.
+        Builds an identifier like "A_Aashiqui_2_mp3" from the first letter
+        of the name plus the full (sanitized) name, so two different songs
+        starting with the same letter don't collide as "duplicates" the
+        way a bare first-letter identifier would."""
+        name = file_name or title
+        if not name:
+            return None
+        safe = re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
+        if not safe:
+            return None
+        first_letter_match = re.search(r'[A-Za-z]', name)
+        first_letter = first_letter_match.group(0).upper() if first_letter_match else "#"
+        return f"{first_letter}_{safe}"[:200]  # 200: comfortably under any TEXT-column/index limits
+
     async def _ingest_channel_audio(self, folder, telegram_file_id: str, message_id: str,
                                      episode_no: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         folder_id = folder["id"]
@@ -1228,8 +1244,24 @@ class BotInstance:
         if not folder:
             return
 
-        source_text = message.caption or message.audio.file_name or message.audio.title or ""
-        episode_no = self._extract_episode_no(source_text)
+        # Caption is deliberately NOT used for episode-number extraction —
+        # only filename and title. (A caption with no digits in it — just
+        # an episode title — could otherwise shadow the real number
+        # sitting in the filename.)
+        episode_no = None
+        for source_text in (message.audio.file_name, message.audio.title):
+            episode_no = self._extract_episode_no(source_text or "")
+            if episode_no is not None:
+                break
+
+        # Songs typically have no number anywhere in filename/title at
+        # all (unlike episodes) — for those, fall back to a
+        # first-letter + full-name identifier instead of rejecting them.
+        if episode_no is None:
+            episode_no = self._fallback_name_identifier(
+                message.audio.file_name, message.audio.title
+            )
+
         if episode_no is None:
             logger.warning(
                 "Could not extract an episode number for message %s in source "
