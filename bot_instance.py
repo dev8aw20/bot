@@ -277,6 +277,10 @@ class BotInstance:
             str(user.id)
         )
 
+        if user.id != self.owner_id and await self.db.is_user_banned(str(user.id)):
+            await update.effective_message.reply_text("\U0001F6AB You are banned from using this bot.")
+            return
+
         if user.id == self.owner_id and (not args or not args[0].startswith("batch_")):
             label = "the owner" if settings["hide_owner"] else f"owner of @{self.bot_username}"
             await update.effective_message.reply_text(
@@ -299,6 +303,44 @@ class BotInstance:
             return
 
         await self._continue_after_gates(update, ctx, settings, args)
+
+    def _resolve_target_user_id(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
+        """Mirrors bot.py's helper of the same purpose: `/ban 12345`, or a
+        bare `/ban` as a reply to the target's message."""
+        if ctx.args:
+            candidate = ctx.args[0].strip()
+            return candidate if candidate.isdigit() else None
+        reply = update.message.reply_to_message if update.message else None
+        if reply and reply.from_user:
+            return str(reply.from_user.id)
+        return None
+
+    # ── /ban /unban — THIS clone's owner only, scoped to THIS clone's own
+    # users table (self.db, not central_db) — has no effect on the master
+    # bot or any other clone. Master-owner-only clone-level banning
+    # (banning the whole bot, not one user) is /cban /cunban in bot.py. ──
+    async def cmd_ban(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        target = self._resolve_target_user_id(update, ctx)
+        if not target:
+            await update.message.reply_text("Usage: /ban <user_id> — or reply to their message with /ban.")
+            return
+        if target == str(self.owner_id):
+            await update.message.reply_text("Can't ban the owner.")
+            return
+        await self.db.ban_user(target)
+        await update.message.reply_text(f"\U0001F6AB Banned user {target}.")
+
+    async def cmd_unban(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.owner_id:
+            return
+        target = self._resolve_target_user_id(update, ctx)
+        if not target:
+            await update.message.reply_text("Usage: /unban <user_id> — or reply to their message with /unban.")
+            return
+        await self.db.unban_user(target)
+        await update.message.reply_text(f"\u2705 Unbanned user {target}.")
 
     def _start_menu_markup(self) -> InlineKeyboardMarkup | None:
         """Buttons shown under the /start message: HELP + ABOUT on one row,
@@ -1674,6 +1716,8 @@ class BotInstance:
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("folders", self.cmd_folders))
         app.add_handler(CommandHandler("forcejoin", self.cmd_forcejoin))
+        app.add_handler(CommandHandler("ban", self.cmd_ban))
+        app.add_handler(CommandHandler("unban", self.cmd_unban))
         app.add_handler(CallbackQueryHandler(self.cb_help, pattern=r"^start_help$"))
         app.add_handler(CallbackQueryHandler(self.cb_about, pattern=r"^start_about$"))
         app.add_handler(CallbackQueryHandler(self.cb_start_back, pattern=r"^start_back$"))

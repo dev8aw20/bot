@@ -102,7 +102,7 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "\U0001F335 Help Menu\n\n"
         "I am a permanent file store bot. You can store files from your "
         "public channel.\n\n"
-        "Available Commands: /start /setting\n"
+        "Available Commands: /start /settings\n"
         "Moderator Commands: /broadcast, /ban, /unban"
     )
     buttons = []
@@ -846,6 +846,9 @@ async def cb_clone_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not clone or clone["user_id"] != str(q.from_user.id):
         await q.answer("Not yours.", show_alert=True)
         return
+    if clone.get("banned") and not clone["is_active"]:
+        await q.answer("This clone was banned by the platform owner.", show_alert=True)
+        return
     new_state = not clone["is_active"]
     await central_db.set_clone_active(clone_id, new_state)
     if new_state:
@@ -865,6 +868,9 @@ async def cb_clone_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone = await central_db.get_clone(clone_id)
     if not clone or clone["user_id"] != str(q.from_user.id):
         await q.answer("Not yours.", show_alert=True)
+        return
+    if clone.get("banned"):
+        await q.answer("This clone was banned by the platform owner.", show_alert=True)
         return
     await runner.stop_one(clone_id)
     await runner.start_one(clone)

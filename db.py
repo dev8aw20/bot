@@ -286,6 +286,17 @@ class Database:
             )
         """)
 
+        # /ban /unban (master bot's OWNER_ID for the master's own users
+        # table; a clone owner's self.owner_id for that clone's users
+        # table — see bot.py / bot_instance.py). This table is always
+        # THE CALLER'S OWN db (central db for master, self.db for a
+        # clone), never shared across clones, so no clone_id column is
+        # needed here.
+        await self.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+
         # ── Master bot's own settings (Settings menu: CUSTOM CAPTION,
         # CUSTOM BUTTON, PROTECT CONTENT). Singleton row, id is always 1 —
         # this is the ONE master bot's config, not per-clone (clones get
@@ -356,6 +367,17 @@ class Database:
             ADD COLUMN IF NOT EXISTS bot_name TEXT
         """)
 
+        # /cban /cunban — MASTER OWNER ONLY, forcibly disables a clone
+        # bot. Deliberately a separate column from is_active: is_active
+        # is the CLONE OWNER's own on/off switch (clone_toggle button),
+        # and a plain is_active=FALSE would let them just flip their own
+        # clone back on, defeating a master-level ban. cb_clone_toggle /
+        # cb_clone_restart in master_menu.py must refuse when banned=TRUE.
+        await self.execute("""
+            ALTER TABLE user_bots
+            ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+
         await self.execute("""
             CREATE INDEX IF NOT EXISTS idx_user_bots_user_id
             ON user_bots (user_id)
@@ -418,6 +440,31 @@ class Database:
                 PRIMARY KEY (clone_id, user_id)
             )
         """)
+
+    # ── /ban /unban helpers (master bot's OWNER_ID, or a clone owner's
+    # self.owner_id — always operates on THIS Database instance's own
+    # `users` table, central db for the master bot, self.db for a
+    # clone) ─────────────────────────────────────────────────────────────
+    async def ban_user(self, user_id: str):
+        """Upsert so a user can be pre-banned even if they've never
+        /start'ed this bot yet, not just an UPDATE on an existing row."""
+        await self.execute(
+            """INSERT INTO users (user_id, banned) VALUES ($1, TRUE)
+               ON CONFLICT (user_id) DO UPDATE SET banned = TRUE""",
+            user_id,
+        )
+
+    async def unban_user(self, user_id: str):
+        await self.execute(
+            "UPDATE users SET banned = FALSE WHERE user_id = $1", user_id
+        )
+
+    async def is_user_banned(self, user_id: str) -> bool:
+        return bool(
+            await self.fetchval(
+                "SELECT banned FROM users WHERE user_id = $1", user_id
+            )
+        )
 
     # ── Per-clone settings helpers ───────────────────────────────────────
     async def get_clone_settings(self, clone_id: int) -> dict:
@@ -566,7 +613,7 @@ class Database:
 
     async def list_clones(self, user_id: str) -> list:
         rows = await self.fetch(
-            "SELECT id, bot_username, bot_name, is_active FROM user_bots "
+            "SELECT id, bot_username, bot_name, is_active, banned FROM user_bots "
             "WHERE user_id = $1 ORDER BY created_at",
             user_id,
         )
@@ -592,8 +639,27 @@ class Database:
     async def get_clone(self, clone_id: int) -> dict | None:
         row = await self.fetchrow(
             "SELECT id, user_id, bot_token, supabase_url, supabase_key, "
-            "bot_username, bot_name, is_active, is_public FROM user_bots WHERE id = $1",
+            "bot_username, bot_name, is_active, is_public, banned "
+            "FROM user_bots WHERE id = $1",
             clone_id,
+        )
+        if not row:
+            return None
+        d = dict(row)
+        d["bot_token"] = decrypt(d["bot_token"])
+        d["supabase_url"] = decrypt(d["supabase_url"]) if d["supabase_url"] else None
+        d["supabase_key"] = decrypt(d["supabase_key"]) if d["supabase_key"] else None
+        return d
+
+    async def get_clone_by_username(self, bot_username: str) -> dict | None:
+        """Case-insensitive lookup, '@' prefix optional — for /cban /cunban
+        where the master owner names a clone by its @username rather than
+        its internal numeric clone_id."""
+        row = await self.fetchrow(
+            "SELECT id, user_id, bot_token, supabase_url, supabase_key, "
+            "bot_username, bot_name, is_active, is_public, banned "
+            "FROM user_bots WHERE lower(bot_username) = lower($1)",
+            bot_username.lstrip("@"),
         )
         if not row:
             return None
@@ -607,6 +673,17 @@ class Database:
         await self.execute(
             "UPDATE user_bots SET is_active = $1 WHERE id = $2",
             is_active, clone_id,
+        )
+
+    async def set_clone_banned(self, clone_id: int, banned: bool):
+        """MASTER OWNER ONLY — see the `banned` column comment in
+        init_schema. Only flips the flag; bot.py's /cban is responsible
+        for also stopping the runner task, and /cunban deliberately does
+        NOT auto-restart the clone (leaves is_active as-is — the clone's
+        own owner re-enables it via their dashboard once unbanned)."""
+        await self.execute(
+            "UPDATE user_bots SET banned = $1 WHERE id = $2",
+            banned, clone_id,
         )
 
     async def touch_clone_activity(self, clone_id: int):

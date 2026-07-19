@@ -866,6 +866,127 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _resolve_target_user_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """/ban and /cban both take either `/ban 12345` or a reply to the
+    target user's message with a bare `/ban`. Returns None if neither is
+    present so the caller can show usage."""
+    if ctx.args:
+        candidate = ctx.args[0].strip()
+        if candidate.isdigit():
+            return candidate
+        return None
+    reply = update.message.reply_to_message
+    if reply and reply.from_user:
+        return str(reply.from_user.id)
+    return None
+
+
+async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Master owner bans a USER from the master bot itself (not a clone —
+    clone owners get their own /ban scoped to their clone, see
+    bot_instance.py). Usage: /ban <user_id>, or reply to their message
+    with /ban."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    target = _resolve_target_user_id(update, ctx)
+    if not target:
+        await update.message.reply_text("Usage: /ban <user_id> — or reply to their message with /ban.")
+        return
+    if target == str(OWNER_ID):
+        await update.message.reply_text("Can't ban the owner.")
+        return
+    await db.ban_user(target)
+    await update.message.reply_text(f"\U0001F6AB Banned user {target}.")
+
+
+async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    target = _resolve_target_user_id(update, ctx)
+    if not target:
+        await update.message.reply_text("Usage: /unban <user_id> — or reply to their message with /unban.")
+        return
+    await db.unban_user(target)
+    await update.message.reply_text(f"\u2705 Unbanned user {target}.")
+
+
+async def cmd_cban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Master owner ONLY — force-disables an entire CLONE BOT (abuse
+    action), distinct from a clone owner's own on/off toggle in their
+    dashboard. Usage: /cban <clone_id or @bot_username>.
+    Actually stops the running clone process immediately, and sets
+    banned=TRUE so the clone owner's own toggle/restart buttons in
+    master_menu.py can't bring it back up while banned."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /cban <clone_id or @bot_username>")
+        return
+    target = ctx.args[0].strip()
+    clone = (
+        await central_db.get_clone(int(target)) if target.isdigit()
+        else await central_db.get_clone_by_username(target)
+    )
+    if not clone:
+        await update.message.reply_text("No clone found with that id/username.")
+        return
+    await central_db.set_clone_active(clone["id"], False)
+    await central_db.set_clone_banned(clone["id"], True)
+    await clone_runner.stop_one(clone["id"])
+    await update.message.reply_text(f"\U0001F6AB Banned and stopped clone @{clone['bot_username']}.")
+
+
+async def cmd_cunban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Master owner ONLY — lifts a /cban. Deliberately does NOT restart
+    the clone: it stays deactivated (is_active is untouched) so the
+    clone's own owner has to explicitly turn it back on from their
+    dashboard, rather than it silently coming back up the moment the
+    master owner types one command."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /cunban <clone_id or @bot_username>")
+        return
+    target = ctx.args[0].strip()
+    clone = (
+        await central_db.get_clone(int(target)) if target.isdigit()
+        else await central_db.get_clone_by_username(target)
+    )
+    if not clone:
+        await update.message.reply_text("No clone found with that id/username.")
+        return
+    await central_db.set_clone_banned(clone["id"], False)
+    await update.message.reply_text(
+        f"\u2705 Unbanned clone @{clone['bot_username']}. It's still OFF — "
+        "its owner needs to switch it back on from their dashboard."
+    )
+
+    # Notify the clone's owner. The clone bot itself isn't running (it's
+    # still deactivated), so this has to go out via the MASTER bot to the
+    # owner's own Telegram chat — they may not even have this master bot
+    # open right now, hence a fresh message rather than editing anything.
+    try:
+        await ctx.bot.send_message(
+            chat_id=int(clone["user_id"]),
+            text=(
+                f"\u2705 Your clone @{clone['bot_username']} has been unbanned.\n\n"
+                "It's currently OFF. Go to Manage Clone's \u2192 your clone's "
+                "dashboard, and use ACTIVATE (then RESTART) to bring it back "
+                "online."
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2699\ufe0f Manage Clone's", callback_data="menu_manage_clones")]]
+            ),
+        )
+    except Forbidden:
+        # Owner has blocked this bot or never started it — the /cunban
+        # itself still succeeded, just log that they won't be notified.
+        logger.warning(
+            "Couldn't notify owner %s of clone %s unban — bot blocked/not started",
+            clone["user_id"], clone["id"],
+        )
+
+
 BROADCAST_MODE = False
 
 
@@ -1236,6 +1357,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
            ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW()""",
         str(update.effective_user.id)
     )
+
+    if update.effective_user.id != OWNER_ID and await db.is_user_banned(str(update.effective_user.id)):
+        await update.message.reply_text("\U0001F6AB You are banned from using this bot.")
+        return
 
     if update.effective_user.id == OWNER_ID:
         passthrough_args = ("settings", "manage_clones")
@@ -1762,6 +1887,10 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("refreshbuttons", cmd_refreshbuttons))
     app.add_handler(CommandHandler("exitbroadcast", exit_broadcast))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("cban", cmd_cban))
+    app.add_handler(CommandHandler("cunban", cmd_cunban))
 
     app.add_handler(CallbackQueryHandler(cb_folder_new, pattern=r"^folder_new$"))
     app.add_handler(CallbackQueryHandler(cb_folder_list, pattern=r"^folder_list$"))
