@@ -29,6 +29,7 @@ something I'd stand behind without testing each flow.
 
 import logging
 import os
+import time as _time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
@@ -66,6 +67,11 @@ AWAITING_ABOUT_EXTRA_LINK = 6
 MAX_CLONES_PER_USER = 2
 
 UPDATE_CHANNEL_URL = None  # bot.py sets this at import time — see wiring note below.
+
+# Set when this module is imported, i.e. at process start — used only for
+# the STATS button's uptime figure. Not persisted, so it resets on every
+# restart/redeploy (that's correct: "uptime" means uptime of THIS process).
+BOT_START_TIME = _time.time()
 
 
 # ── STARTUP MENU (called FROM bot.py's own cmd_start — not a handler here) ──
@@ -106,6 +112,64 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("STATS", callback_data="menu_stats")]
         )
     buttons.append([InlineKeyboardButton("BACK", callback_data="menu_startup")])
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def cb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner-only global STATS button. Covers: total users, total/active/
+    running clones, the MASTER bot's own file storage (folders/batches/
+    audios), and process uptime.
+
+    Deliberately does NOT sum file counts across every clone's own
+    database — clones can point at arbitrary external Supabase
+    instances (see create_clone), so that would mean opening N live DB
+    connections on every single button press. That's a per-clone job
+    (STATS on that clone's own dashboard, already wired to
+    cb_clone_stats in clone_features.py), not something to fold in here
+    silently.
+    """
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    await q.answer()
+
+    central_db: Database = ctx.application.bot_data["central_db"]
+    runner = ctx.application.bot_data["runner"]
+
+    total_users = await central_db.fetchval("SELECT COUNT(*) FROM users") or 0
+    total_clones = await central_db.fetchval("SELECT COUNT(*) FROM user_bots") or 0
+    active_rows = await central_db.fetch(
+        "SELECT id FROM user_bots WHERE is_active = TRUE"
+    )
+    active_clones = len(active_rows)
+    running_clones = sum(1 for r in active_rows if runner.is_running(r["id"]))
+
+    master_folders = await central_db.fetchval("SELECT COUNT(*) FROM folders") or 0
+    master_batches = await central_db.fetchval("SELECT COUNT(*) FROM batches") or 0
+    master_audios = await central_db.fetchval("SELECT COUNT(*) FROM audios") or 0
+
+    uptime_seconds = int(_time.time() - BOT_START_TIME)
+    days, rem = divmod(uptime_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    uptime_str = f"{days}d {hours}h {minutes}m"
+
+    text = (
+        "\U0001F4CA Master Bot Stats\n\n"
+        f"Uptime: {uptime_str}\n\n"
+        f"Total users: {total_users}\n"
+        f"Total clones: {total_clones} "
+        f"({active_clones} active, {running_clones} currently running)\n\n"
+        "Master bot storage —\n"
+        f"Folders: {master_folders}\n"
+        f"Batches: {master_batches}\n"
+        f"Audios: {master_audios}\n\n"
+        "\u2139\ufe0f File counts above are for the master bot only. Each "
+        "clone stores files in its own linked database — open that "
+        "clone's dashboard \u2192 STATS for its numbers."
+    )
+    buttons = [[InlineKeyboardButton("\u2039 BACK", callback_data="menu_help")]]
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -850,6 +914,7 @@ def register(application: Application):
     command and calls startup_menu() directly for the plain-/start case."""
     application.add_handler(CallbackQueryHandler(cb_startup, pattern=r"^menu_startup$"))
     application.add_handler(CallbackQueryHandler(cb_help, pattern=r"^menu_help$"))
+    application.add_handler(CallbackQueryHandler(cb_stats, pattern=r"^menu_stats$"))
     application.add_handler(CallbackQueryHandler(cb_about, pattern=r"^menu_about$"))
     application.add_handler(CallbackQueryHandler(cb_manage_clones, pattern=r"^menu_manage_clones$"))
     application.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^menu_settings$"))
