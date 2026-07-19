@@ -169,7 +169,72 @@ async def cb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "clone stores files in its own linked database — open that "
         "clone's dashboard \u2192 STATS for its numbers."
     )
-    buttons = [[InlineKeyboardButton("\u2039 BACK", callback_data="menu_help")]]
+    buttons = [
+        [InlineKeyboardButton("\U0001F4CB ALL CLONES", callback_data="menu_stats_clones")],
+        [InlineKeyboardButton("\u2039 BACK", callback_data="menu_help")],
+    ]
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+STATS_CLONES_PAGE_SIZE = 25
+
+
+async def cb_stats_all_clones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """STATS -> ALL CLONES. Owner-only listing of every clone: id,
+    username, owner user_id, and status — id is the thing /cban, /cunban,
+    and the clone dashboard all key off, which is exactly why this exists
+    (previously the only way to find a clone's id was reading it off its
+    own STATS button one at a time)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    await q.answer()
+
+    page = 0
+    if q.data.startswith("menu_stats_clones_"):
+        page = int(q.data.rsplit("_", 1)[1])
+
+    central_db: Database = ctx.application.bot_data["central_db"]
+    runner = ctx.application.bot_data["runner"]
+    clones = await central_db.list_all_clones()
+
+    if not clones:
+        text = "\U0001F4CB No clones yet."
+        buttons = [[InlineKeyboardButton("\u2039 BACK", callback_data="menu_stats")]]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    start = page * STATS_CLONES_PAGE_SIZE
+    page_rows = clones[start:start + STATS_CLONES_PAGE_SIZE]
+    total_pages = (len(clones) - 1) // STATS_CLONES_PAGE_SIZE + 1
+
+    lines = [f"\U0001F4CB All Clones ({len(clones)} total)\n"]
+    for c in page_rows:
+        if c["banned"]:
+            status = "\U0001F6AB banned"
+        elif runner.is_running(c["id"]):
+            status = "\U0001F7E2 running"
+        elif c["is_active"]:
+            status = "\U0001F7E1 active (not running)"
+        else:
+            status = "\u26AA off"
+        name = c["bot_name"] or c["bot_username"]
+        lines.append(
+            f"ID: {c['id']} — @{c['bot_username']} ({name}) — owner {c['user_id']} — {status}"
+        )
+    text = "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("\u2039 Prev", callback_data=f"menu_stats_clones_{page - 1}"))
+    if start + STATS_CLONES_PAGE_SIZE < len(clones):
+        nav_row.append(InlineKeyboardButton("Next \u203a", callback_data=f"menu_stats_clones_{page + 1}"))
+    buttons = []
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("\u2039 BACK", callback_data="menu_stats")])
+
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -921,6 +986,7 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_startup, pattern=r"^menu_startup$"))
     application.add_handler(CallbackQueryHandler(cb_help, pattern=r"^menu_help$"))
     application.add_handler(CallbackQueryHandler(cb_stats, pattern=r"^menu_stats$"))
+    application.add_handler(CallbackQueryHandler(cb_stats_all_clones, pattern=r"^menu_stats_clones(_\d+)?$"))
     application.add_handler(CallbackQueryHandler(cb_about, pattern=r"^menu_about$"))
     application.add_handler(CallbackQueryHandler(cb_manage_clones, pattern=r"^menu_manage_clones$"))
     application.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^menu_settings$"))

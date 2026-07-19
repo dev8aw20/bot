@@ -636,6 +636,17 @@ class Database:
             out.append(d)
         return out
 
+    async def list_all_clones(self) -> list:
+        """EVERY clone, any owner, any status — for the master owner's
+        STATS -> ALL CLONES listing. Deliberately does NOT select or
+        decrypt bot_token/supabase_url/supabase_key: this is a display
+        query for a Telegram chat, and those are credentials, not stats."""
+        rows = await self.fetch(
+            "SELECT id, user_id, bot_username, bot_name, is_active, banned "
+            "FROM user_bots ORDER BY id"
+        )
+        return [dict(r) for r in rows]
+
     async def get_clone(self, clone_id: int) -> dict | None:
         row = await self.fetchrow(
             "SELECT id, user_id, bot_token, supabase_url, supabase_key, "

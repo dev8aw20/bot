@@ -738,7 +738,7 @@ async def cb_clone_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     runner = ctx.application.bot_data["runner"]
     running = "running" if runner.is_running(clone_id) else "stopped"
     await q.message.reply_text(
-        f"\U0001F4CA Stats for @{clone['bot_username']} ({running})\n\n"
+        f"\U0001F4CA Stats for @{clone['bot_username']} (ID: {clone_id}) ({running})\n\n"
         f"Folders: {folders}\nBatches: {batches}\nAudios: {audios}\nUsers: {users}",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")]]
