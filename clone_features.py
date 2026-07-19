@@ -503,8 +503,9 @@ async def cb_autodelete_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     def _label(text, minutes):
         return f"\u2705 {text}" if s["auto_delete_enabled"] and current_minutes == minutes else text
 
+    toggle_label = "Disable \u274c" if s["auto_delete_enabled"] else "Enable \u2705"
     buttons = [
-        [InlineKeyboardButton("Disable \u274c", callback_data=f"ad_toggle_{clone_id}")],
+        [InlineKeyboardButton(toggle_label, callback_data=f"ad_toggle_{clone_id}")],
         [InlineKeyboardButton(_label("5m", 5), callback_data=f"ad_time_{clone_id}_5"),
          InlineKeyboardButton(_label("15m", 15), callback_data=f"ad_time_{clone_id}_15"),
          InlineKeyboardButton(_label("1h", 60), callback_data=f"ad_time_{clone_id}_60")],
