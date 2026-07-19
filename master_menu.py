@@ -102,7 +102,7 @@ async def cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "\U0001F335 Help Menu\n\n"
         "I am a permanent file store bot. You can store files from your "
         "public channel.\n\n"
-        "Available Commands: /start /settings\n"
+        "Available Commands: /start /setting\n"
         "Moderator Commands: /broadcast, /ban, /unban"
     )
     buttons = []
