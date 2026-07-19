@@ -112,6 +112,8 @@ class CloneRunner:
             if hasattr(instance, "connect_db"):
                 await instance.connect_db()
             await app.initialize()
+            if hasattr(instance, "setup_commands"):
+                await instance.setup_commands(app)
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
             # Park here until stop_one() cancels this task.

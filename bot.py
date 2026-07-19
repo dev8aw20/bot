@@ -1774,6 +1774,10 @@ async def _setup_bot_commands(application: Application):
         BotCommand("exitbroadcast", "Exit broadcast mode"),
         BotCommand("setting", "setting use"),
         BotCommand("aboutset", "about set kara bot"),
+        BotCommand("ban", "Ban a user from this bot"),
+        BotCommand("unban", "Unban a user from this bot"),
+        BotCommand("cban", "Ban a whole clone bot (by id/@username)"),
+        BotCommand("cunban", "Unban a clone bot (by id/@username)"),
     ]
 
     try:

@@ -46,7 +46,10 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ChatJoinRequestHandler, filters, ContextTypes,
@@ -1778,3 +1781,30 @@ class BotInstance:
         if isinstance(self.db, Database):
             await self.db.connect()
             await self.db.init_schema()
+
+    async def setup_commands(self, app: Application):
+        """Telegram '/' command menu for THIS clone. Same split as the
+        master bot's _setup_bot_commands: a public menu for everyone, and
+        a chat-scoped menu (only inside self.owner_id's own chat) with the
+        owner-only commands added on top. Must be called from
+        CloneRunner._run_one after app.initialize() — set_my_commands is
+        an API call and needs a live bot connection, same reasoning as
+        connect_db above being called before app.initialize() rather than
+        in build_application (which is sync and runs before the bot is
+        connected)."""
+        public_commands = [BotCommand("start", "Start the bot")]
+        owner_commands = public_commands + [
+            BotCommand("folders", "Manage folders (output + source channel)"),
+            BotCommand("ban", "Ban a user from this bot"),
+            BotCommand("unban", "Unban a user from this bot"),
+        ]
+        try:
+            await app.bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
+            await app.bot.set_my_commands(
+                owner_commands, scope=BotCommandScopeChat(chat_id=self.owner_id)
+            )
+        except Exception:
+            # Non-fatal — command menu is cosmetic, the clone should still
+            # run even if this API call fails (e.g. owner never started
+            # a DM with this bot yet, so the chat-scoped call 400s).
+            logger.exception("Clone %s: failed to set command menu", self.clone_id)
