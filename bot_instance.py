@@ -1211,7 +1211,12 @@ class BotInstance:
         summary = f"\u2705 {success_count}/{total_pages} messages reposted to the new channel."
         if failed_pages:
             summary += f"\n\u26a0\ufe0f Failed: page #{', #'.join(str(i) for i in failed_pages)}"
-        await update.message.reply_text(summary)
+        await update.message.reply_text(
+            summary,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"folder_manage_{folder_id}")]]
+            ),
+        )
 
     # ── Automatic ingestion from a folder's source channel (converted from
     # bot.py's handle_channel_audio / _ingest_channel_audio / render_folder_page
@@ -1560,7 +1565,15 @@ class BotInstance:
                 )
                 self.awaiting_channel_id_for_folder = None
                 self.new_folder_pending_source = False
-                await update.message.reply_text("\u2705 Output Channel ID saved and verified.")
+                # No back button when this is mid-wizard or about to be
+                # followed by a repost summary — those carry their own.
+                terminal = not is_new_folder_wizard and not had_previous_channel
+                await update.message.reply_text(
+                    "\u2705 Output Channel ID saved and verified.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("\u2039 back", callback_data=f"folder_manage_{folder_id}")]]
+                    ) if terminal else None,
+                )
             except Exception as e:
                 self.awaiting_channel_id_for_folder = None
                 self.new_folder_pending_source = False
@@ -1628,7 +1641,10 @@ class BotInstance:
             self.awaiting_source_channel_id_for_folder = None
             await update.message.reply_text(
                 "\u2705 Source channel saved and verified.\n\n"
-                "Any audio posted in that channel from now on will be picked up automatically."
+                "Any audio posted in that channel from now on will be picked up automatically.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data=f"folder_manage_{folder_id}")]]
+                ),
             )
             return
 
@@ -1641,7 +1657,12 @@ class BotInstance:
                 text, self.awaiting_force_join_edit_channel_id
             )
             self.awaiting_force_join_edit_channel_id = None
-            await update.message.reply_text("\u2705 Invite link updated.")
+            await update.message.reply_text(
+                "\u2705 Invite link updated.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data="forcejoin_list")]]
+                ),
+            )
             return
 
         if self.awaiting_force_join_step == "id":
@@ -1715,7 +1736,12 @@ class BotInstance:
             self.awaiting_force_join_step = None
             self.force_join_pending_channel_id = None
             self.force_join_pending_title = None
-            await update.message.reply_text(f"\u2705 \"{title_done}\" added to the force-join list.")
+            await update.message.reply_text(
+                f"\u2705 \"{title_done}\" added to the force-join list.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("\u2039 back", callback_data="forcejoin_list")]]
+                ),
+            )
             return
 
         # No owner-wizard state pending and no other owner-text feature

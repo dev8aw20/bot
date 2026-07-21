@@ -918,7 +918,10 @@ async def _handle_transfer_db_uri(update, ctx, clone_id, uri):
         await runner.stop_one(clone_id)
         await runner.start_one(clone)
     await update.message.reply_text(
-        "\u2705 Transferred. This clone now runs on your own database and has been restarted."
+        "\u2705 Transferred. This clone now runs on your own database and has been restarted.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")]]
+        ),
     )
     return ConversationHandler.END
 

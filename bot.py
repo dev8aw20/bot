@@ -551,7 +551,12 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
     summary = f"✅ {success_count}/{total_pages} messages reposted to the new channel."
     if failed_pages:
         summary += f"\n⚠️ Failed: page #{', #'.join(str(i) for i in failed_pages)}"
-    await update.message.reply_text(summary)
+    await update.message.reply_text(
+        summary,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("‹ back", callback_data=f"folder_manage_{folder_id}")]]
+        ),
+    )
 
 
 # ── Text message handler ──────────────────────────────────────────────────────
@@ -673,7 +678,12 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text, awaiting_force_join_edit_channel_id
         )
         awaiting_force_join_edit_channel_id = None
-        await update.message.reply_text("✅ Invite link updated.")
+        await update.message.reply_text(
+            "✅ Invite link updated.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ back", callback_data="forcejoin_list")]]
+            ),
+        )
         return
 
     global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
@@ -749,7 +759,12 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         awaiting_force_join_step = None
         force_join_pending_channel_id = None
         force_join_pending_title = None
-        await update.message.reply_text(f"✅ \"{title_done}\" added to the force-join list.")
+        await update.message.reply_text(
+            f"✅ \"{title_done}\" added to the force-join list.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ back", callback_data="forcejoin_list")]]
+            ),
+        )
         return
 
     if awaiting_channel_id_for_folder is not None:
@@ -767,7 +782,15 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await db.execute("UPDATE folders SET channel_id = $1 WHERE id = $2", text, folder_id)
             awaiting_channel_id_for_folder = None
             new_folder_pending_source = False
-            await update.message.reply_text("✅ Output Channel ID saved and verified.")
+            # No back button here when this is mid-wizard or about to be
+            # followed by a repost summary — those messages carry their own.
+            terminal = not is_new_folder_wizard and not had_previous_channel
+            await update.message.reply_text(
+                "✅ Output Channel ID saved and verified.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("‹ back", callback_data=f"folder_manage_{folder_id}")]]
+                ) if terminal else None,
+            )
         except Exception as e:
             awaiting_channel_id_for_folder = None
             new_folder_pending_source = False
@@ -834,7 +857,10 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         awaiting_source_channel_id_for_folder = None
         await update.message.reply_text(
             "✅ Source channel saved and verified.\n\n"
-            "Any audio posted in that channel from now on will be picked up automatically."
+            "Any audio posted in that channel from now on will be picked up automatically.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("‹ back", callback_data=f"folder_manage_{folder_id}")]]
+            ),
         )
         return
 
