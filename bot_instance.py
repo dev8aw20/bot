@@ -237,15 +237,6 @@ class BotInstance:
         # bot_settings row. See cb_settings_menu below.
         self.awaiting_caption_text: bool = False
         self.awaiting_button_line: bool = False
-        # Which user_id currently "owns" the in-progress text wizard above
-        # (folder rename/create/channel input, caption/button edit). These
-        # awaiting_* flags live on `self` — shared by the whole clone, not
-        # per-user — so once moderators are allowed to drive them too, we
-        # need to make sure the owner's pending flow can't accidentally be
-        # completed by a moderator's unrelated text (or vice-versa). Every
-        # place that STARTS one of the flows above also sets this; the text
-        # dispatcher (handle_owner_text) checks it before doing anything.
-        self._pending_actor_id: int | None = None
         self.cancelled_deliveries: set[tuple[int, int]] = set()
         # Per-folder asyncio.Lock so concurrent audio posts to the same
         # source channel don't race on batch total_links/page rendering.
@@ -266,34 +257,6 @@ class BotInstance:
         self.awaiting_force_join_edit_channel_id = None
         self.awaiting_caption_text = False
         self.awaiting_button_line = False
-        self._pending_actor_id = None
-
-    async def _is_staff(self, user_id: int) -> bool:
-        """Owner or moderator. A moderator is a per-clone "sub-owner" added
-        from the master bot's dashboard (clone_features.py MODERATORS) —
-        they get access ONLY to what calls this helper: Folders and
-        Settings. Force-join, broadcast, ban/unban, and everything else
-        stays gated to self.owner_id directly and never calls this.
-
-        Moderator rows live in THIS clone's own db (self.db), same as
-        force_join_channels — never central_db, which only ever holds
-        this clone's registry row (bot_token, supabase_url, etc.), not
-        its moderators.
-
-        The owner can never be frozen — freezing only ever applies to a
-        moderator row, so the owner check below short-circuits before it.
-        A frozen moderator is treated as non-staff (same as not being a
-        moderator at all) until the freeze is lifted or expires, but stays
-        in the moderators list so the owner can see and un-freeze them."""
-        if user_id == self.owner_id:
-            return True
-        uid = str(user_id)
-        mods = await self.db.list_moderators()
-        if uid not in mods:
-            return False
-        if await self.db.is_moderator_frozen(uid):
-            return False
-        return True
 
     # ── /start (converted from cmd_start in bot.py) ─────────────────────
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -301,20 +264,16 @@ class BotInstance:
         settings = await self.central_db.get_clone_settings(self.clone_id)
         user = update.effective_user
         args = ctx.args
-        is_staff = await self._is_staff(user.id)
 
-        if is_staff:
-            # /start doubles as a "cancel" out of any pending text-wizard
-            # (caption edit, button-line add, folder rename, etc.) — there's
-            # no separate /cancel command wired up in this codebase (see
-            # handle_owner_text: it's a single dispatcher on self.awaiting_*
-            # flags, not a ConversationHandler), so this is the only exit.
-            # Only reset if nobody else's wizard is currently in flight (or
-            # it's this same user's) — otherwise the owner hitting /start
-            # could wipe out a moderator's in-progress folder edit, or vice
-            # versa, since these flags are shared per-clone, not per-user.
-            if self._pending_actor_id is None or self._pending_actor_id == user.id:
-                self._reset_owner_state()
+        if user.id == self.owner_id:
+            # /start doubles as the owner's "cancel" out of any pending
+            # text-wizard (caption edit, button-line add, folder rename,
+            # etc.) — there's no separate /cancel command wired up in this
+            # codebase (see handle_owner_text: it's a single dispatcher on
+            # self.awaiting_* flags, not a ConversationHandler), so this is
+            # the only exit. Don't tell owners to send /cancel elsewhere;
+            # it isn't a registered command and would just be swallowed.
+            self._reset_owner_state()
 
         await self.db.execute(
             """INSERT INTO users (user_id) VALUES ($1)
@@ -322,14 +281,12 @@ class BotInstance:
             str(user.id)
         )
 
-        if not is_staff and await self.db.is_user_banned(str(user.id)):
+        if user.id != self.owner_id and await self.db.is_user_banned(str(user.id)):
             await update.effective_message.reply_text("\U0001F6AB You are banned from using this bot.")
             return
 
-        if is_staff and (not args or not args[0].startswith("batch_")):
+        if user.id == self.owner_id and (not args or not args[0].startswith("batch_")):
             label = "the owner" if settings["hide_owner"] else f"owner of @{self.bot_username}"
-            if user.id != self.owner_id:
-                label = "a moderator"
             await update.effective_message.reply_text(
                 f"Welcome back, {label}.\n\nUse /folders to manage your folders.",
                 reply_markup=InlineKeyboardMarkup([
@@ -339,7 +296,7 @@ class BotInstance:
             )
             return
 
-        if not self.is_public and not is_staff:
+        if not self.is_public and user.id != self.owner_id:
             await update.effective_message.reply_text(
                 "This bot is private — only the owner can use it."
             )
@@ -523,8 +480,8 @@ class BotInstance:
     # flows above (no ConversationHandler — see module docstring).
     async def cb_settings_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
-            await q.answer("\u26d4 Only the bot owner or a moderator can use Settings.", show_alert=True)
+        if q.from_user.id != self.owner_id:
+            await q.answer("\u26d4 Only the bot owner can use Settings.", show_alert=True)
             return
         await q.answer()
         settings = await self.central_db.get_clone_settings(self.clone_id)
@@ -545,7 +502,7 @@ class BotInstance:
 
     async def cb_settings_protect_toggle(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         settings = await self.central_db.get_clone_settings(self.clone_id)
@@ -556,7 +513,7 @@ class BotInstance:
 
     async def cb_settings_caption_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -578,12 +535,11 @@ class BotInstance:
 
     async def cb_settings_caption_edit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
         self.awaiting_caption_text = True
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text(
             "Send the new caption template. You can use {file_name}, "
             "{file_size}, {caption}. Send /start to cancel."
@@ -591,7 +547,7 @@ class BotInstance:
 
     async def cb_settings_caption_see(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -606,7 +562,7 @@ class BotInstance:
 
     async def cb_settings_caption_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await self.central_db.update_clone_settings(self.clone_id, custom_caption=None)
@@ -615,7 +571,7 @@ class BotInstance:
 
     async def cb_settings_button_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -632,12 +588,11 @@ class BotInstance:
 
     async def cb_settings_button_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
         self.awaiting_button_line = True
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text(
             "Send a new button row: \"Label - URL\", or two on the same row "
             "with \"Label1 - URL1 | Label2 - URL2\". This is ADDED as a new "
@@ -646,7 +601,7 @@ class BotInstance:
 
     async def cb_settings_button_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             await q.answer("Not allowed.", show_alert=True)
             return
         await self.central_db.update_clone_settings(self.clone_id, custom_buttons=None)
@@ -987,7 +942,6 @@ class BotInstance:
             return
         self._reset_owner_state()
         self.awaiting_force_join_step = "id"
-        self._pending_actor_id = update.effective_user.id
         await update.callback_query.edit_message_text(
             "\U0001F4E1 Send the Channel/Group ID or @username (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
             "\u26a0\ufe0f The bot must be made an admin there (to see members, and to receive join "
@@ -1014,7 +968,6 @@ class BotInstance:
             await self._show_force_join_management(update, ctx)
             return
         self.awaiting_force_join_edit_channel_id = row["channel_id"]
-        self._pending_actor_id = update.effective_user.id
         await update.callback_query.edit_message_text(
             f"\U0001F517 Send a new invite link for \"{row['title'] or row['channel_id']}\".\n\n"
             "\u26a0\ufe0f If the link is expiring or showing 'invalid', keep both the expiry date "
@@ -1054,7 +1007,7 @@ class BotInstance:
     # owner already gets independent access to their own folders, they
     # were just missing everything past folder creation. ────────────────
     async def cmd_folders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not await self._is_staff(update.effective_user.id):
+        if update.effective_user.id != self.owner_id:
             return
         await self._show_folder_management(update, ctx)
 
@@ -1088,17 +1041,16 @@ class BotInstance:
     async def cb_folder_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         self._reset_owner_state()
         self.awaiting_new_folder_name = True
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text("\U0001F4C1 Send the name for the new folder:")
 
     async def cb_folder_manage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_manage_", ""))
         folder = await self.db.fetchrow(
@@ -1127,7 +1079,7 @@ class BotInstance:
     async def cb_folder_rename(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_rename_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1136,7 +1088,6 @@ class BotInstance:
             return
         self._reset_owner_state()
         self.awaiting_rename_folder_id = folder_id
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text(f"\U0001F4DD Send the new name for \"{folder['name']}\":")
 
     async def cb_folder_delete_confirm(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1145,7 +1096,7 @@ class BotInstance:
         records too (delete_folder_cascade), not just the folder row."""
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_delete_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1165,7 +1116,7 @@ class BotInstance:
 
     async def cb_folder_delete_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_delete_yes_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1185,19 +1136,18 @@ class BotInstance:
     async def cb_folder_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         await self._show_folder_management(update, ctx)
 
     async def cb_folder_setchannel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_setchannel_", ""))
         self._reset_owner_state()
         self.awaiting_channel_id_for_folder = folder_id
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text(
             "\U0001F4E1 Send the Channel ID (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
             "\u26a0\ufe0f The bot must be made an admin in that channel (with Post Messages permission)."
@@ -1206,12 +1156,11 @@ class BotInstance:
     async def cb_folder_setsource(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if not await self._is_staff(q.from_user.id):
+        if q.from_user.id != self.owner_id:
             return
         folder_id = int(q.data.replace("folder_setsource_", ""))
         self._reset_owner_state()
         self.awaiting_source_channel_id_for_folder = folder_id
-        self._pending_actor_id = q.from_user.id
         await q.edit_message_text(
             "\U0001F4E5 Send the *source* Channel ID (e.g. @channelusername or -100xxxxxxxxxx) — "
             "this is the private channel the bot will watch for new audio.\n\n"
@@ -1516,14 +1465,7 @@ class BotInstance:
     # link intake) is NOT ported here yet, so non-owner messages are
     # ignored rather than silently mishandled. ──────────────────────────
     async def handle_owner_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not await self._is_staff(user_id):
-            return
-        # awaiting_* flags below are shared per-clone state, not per-user —
-        # if someone else's wizard (folder rename, caption edit, etc.) is
-        # currently in flight, don't let this person's text get swallowed
-        # into it (and don't let it interrupt/complete their flow either).
-        if self._pending_actor_id is not None and user_id != self._pending_actor_id:
+        if update.effective_user.id != self.owner_id:
             return
         text = (update.message.text or "").strip()
 

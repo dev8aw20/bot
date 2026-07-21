@@ -432,23 +432,12 @@ class Database:
             ADD COLUMN IF NOT EXISTS custom_buttons TEXT
         """)
 
-        # clone_moderators lives in the CLONE's OWN database, same model as
-        # force_join_channels — NOT the shared central db keyed by clone_id.
-        # Every clone has its own dedicated Supabase (BotInstance.__init__
-        # refuses to start a clone without one), so scoping by clone_id
-        # here would be redundant and, worse, wrong: this table has no FK
-        # to user_bots (that table only exists in the central db, not in a
-        # clone's own db) — one clone's own db only ever holds that one
-        # clone's moderators, isolated by which physical database you're
-        # connected to, not by a column. init_schema() runs against BOTH
-        # the central db (bot.py, at master startup) and every clone's own
-        # db (bot_instance.py connect_db) using this same function, so this
-        # table also gets created (unused) in the central db — harmless.
         await self.execute("""
             CREATE TABLE IF NOT EXISTS clone_moderators (
-                user_id TEXT PRIMARY KEY,
+                clone_id INTEGER NOT NULL REFERENCES user_bots(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL,
                 added_at TIMESTAMP DEFAULT NOW(),
-                frozen_until TIMESTAMP
+                PRIMARY KEY (clone_id, user_id)
             )
         """)
 
@@ -525,54 +514,23 @@ class Database:
             *fields.values(),
         )
 
-    async def add_moderator(self, user_id: str):
+    async def add_moderator(self, clone_id: int, user_id: str):
         await self.execute(
-            "INSERT INTO clone_moderators (user_id) VALUES ($1) "
+            "INSERT INTO clone_moderators (clone_id, user_id) VALUES ($1, $2) "
             "ON CONFLICT DO NOTHING",
-            user_id,
+            clone_id, user_id,
         )
 
-    async def list_moderators(self) -> list:
-        rows = await self.fetch("SELECT user_id FROM clone_moderators")
+    async def list_moderators(self, clone_id: int) -> list:
+        rows = await self.fetch(
+            "SELECT user_id FROM clone_moderators WHERE clone_id = $1", clone_id
+        )
         return [r["user_id"] for r in rows]
 
-    async def list_moderators_detailed(self) -> list:
-        """Like list_moderators but includes frozen_until, so the dashboard
-        can show freeze status without a second query per moderator."""
-        rows = await self.fetch(
-            "SELECT user_id, frozen_until FROM clone_moderators ORDER BY added_at"
-        )
-        return [dict(r) for r in rows]
-
-    async def remove_moderator(self, user_id: str):
+    async def remove_moderator(self, clone_id: int, user_id: str):
         await self.execute(
-            "DELETE FROM clone_moderators WHERE user_id = $1", user_id
-        )
-
-    async def freeze_moderator(self, user_id: str, minutes: int):
-        """Suspend a moderator's staff access for `minutes` minutes without
-        removing them from the moderators list."""
-        await self.execute(
-            "UPDATE clone_moderators SET frozen_until = NOW() + ($2 || ' minutes')::interval "
-            "WHERE user_id = $1",
-            user_id, str(minutes),
-        )
-
-    async def unfreeze_moderator(self, user_id: str):
-        await self.execute(
-            "UPDATE clone_moderators SET frozen_until = NULL WHERE user_id = $1",
-            user_id,
-        )
-
-    async def is_moderator_frozen(self, user_id: str) -> bool:
-        # Comparison done in SQL (frozen_until > NOW()) rather than pulling
-        # the value into Python, so this can't drift out of sync with
-        # whatever timezone the DB server's NOW() actually uses.
-        return bool(
-            await self.fetchval(
-                "SELECT frozen_until > NOW() FROM clone_moderators WHERE user_id = $1",
-                user_id,
-            )
+            "DELETE FROM clone_moderators WHERE clone_id = $1 AND user_id = $2",
+            clone_id, user_id,
         )
 
     # ── Clone registry helpers ───────────────────────────────────────────
