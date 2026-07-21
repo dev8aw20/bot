@@ -170,9 +170,58 @@ async def cb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "clone's dashboard \u2192 STATS for its numbers."
     )
     buttons = [
+        [InlineKeyboardButton("\U0001F465 USERS", callback_data="menu_stats_users")],
         [InlineKeyboardButton("\U0001F4CB ALL CLONES", callback_data="menu_stats_clones")],
         [InlineKeyboardButton("\u2039 BACK", callback_data="menu_help")],
     ]
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+MASTER_USERS_PAGE_SIZE = 30
+
+
+async def cb_stats_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """STATS -> USERS for the MASTER bot itself (not any clone — a clone's
+    own users are under that clone's own STATS -> USERS, cb_clone_users
+    in clone_features.py). Lists user_id and ban status from the master
+    bot's own `users` table (central_db)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    await q.answer()
+
+    page = 0
+    if q.data.startswith("menu_stats_users_"):
+        page = int(q.data.rsplit("_", 1)[1])
+
+    central_db: Database = ctx.application.bot_data["central_db"]
+    total = await central_db.fetchval("SELECT COUNT(*) FROM users") or 0
+    rows = await central_db.fetch(
+        "SELECT user_id, banned FROM users ORDER BY first_seen "
+        "LIMIT $1 OFFSET $2",
+        MASTER_USERS_PAGE_SIZE, page * MASTER_USERS_PAGE_SIZE,
+    )
+
+    if not rows:
+        text = "\U0001F465 No users yet."
+    else:
+        lines = [f"\U0001F465 Master Bot Users ({total} total)\n"]
+        for r in rows:
+            marker = " \U0001F6AB banned" if r["banned"] else ""
+            lines.append(f"{r['user_id']}{marker}")
+        text = "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("\u2039 Prev", callback_data=f"menu_stats_users_{page - 1}"))
+    if (page + 1) * MASTER_USERS_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("Next \u203a", callback_data=f"menu_stats_users_{page + 1}"))
+    buttons = []
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("\u2039 BACK", callback_data="menu_stats")])
+
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -987,6 +1036,7 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_help, pattern=r"^menu_help$"))
     application.add_handler(CallbackQueryHandler(cb_stats, pattern=r"^menu_stats$"))
     application.add_handler(CallbackQueryHandler(cb_stats_all_clones, pattern=r"^menu_stats_clones(_\d+)?$"))
+    application.add_handler(CallbackQueryHandler(cb_stats_users, pattern=r"^menu_stats_users(_\d+)?$"))
     application.add_handler(CallbackQueryHandler(cb_about, pattern=r"^menu_about$"))
     application.add_handler(CallbackQueryHandler(cb_manage_clones, pattern=r"^menu_manage_clones$"))
     application.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^menu_settings$"))

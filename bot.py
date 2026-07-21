@@ -866,43 +866,63 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _resolve_target_user_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """/ban and /cban both take either `/ban 12345` or a reply to the
-    target user's message with a bare `/ban`. Returns None if neither is
-    present so the caller can show usage."""
-    if ctx.args:
-        candidate = ctx.args[0].strip()
-        if candidate.isdigit():
-            return candidate
-        return None
+def _resolve_ban_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
+    """/ban and /unban take either:
+      - `/ban 12345 spamming links` (user_id, then optional reason), or
+      - a reply to the target's message with `/ban spamming links` (reason only, no id needed)
+    Returns (user_id, reason); user_id is None if neither form matched."""
     reply = update.message.reply_to_message
     if reply and reply.from_user:
-        return str(reply.from_user.id)
-    return None
+        reason = " ".join(ctx.args).strip() if ctx.args else None
+        return str(reply.from_user.id), (reason or None)
+    if ctx.args and ctx.args[0].strip().isdigit():
+        target = ctx.args[0].strip()
+        reason = " ".join(ctx.args[1:]).strip() if len(ctx.args) > 1 else None
+        return target, (reason or None)
+    return None, None
+
+
+async def _notify_banned_user(ctx: ContextTypes.DEFAULT_TYPE, target: str, reason: str | None):
+    """Best-effort DM to the banned user explaining why. Never lets a
+    failure here (blocked bot, never started a chat, etc.) undo the ban
+    itself — the ban already happened in the DB before this is called."""
+    text = "\U0001F6AB You have been banned from this bot."
+    if reason:
+        text += f"\n\nReason: {reason}"
+    try:
+        await ctx.bot.send_message(chat_id=int(target), text=text)
+    except Forbidden:
+        logger.warning("Couldn't notify banned user %s — bot blocked/not started", target)
 
 
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Master owner bans a USER from the master bot itself (not a clone —
     clone owners get their own /ban scoped to their clone, see
-    bot_instance.py). Usage: /ban <user_id>, or reply to their message
-    with /ban."""
+    bot_instance.py). Usage: /ban <user_id> [reason], or reply to their
+    message with /ban [reason]."""
     if update.effective_user.id != OWNER_ID:
         return
-    target = _resolve_target_user_id(update, ctx)
+    target, reason = _resolve_ban_target(update, ctx)
     if not target:
-        await update.message.reply_text("Usage: /ban <user_id> — or reply to their message with /ban.")
+        await update.message.reply_text(
+            "Usage: /ban <user_id> [reason] — or reply to their message with /ban [reason]."
+        )
         return
     if target == str(OWNER_ID):
         await update.message.reply_text("Can't ban the owner.")
         return
     await db.ban_user(target)
-    await update.message.reply_text(f"\U0001F6AB Banned user {target}.")
+    await _notify_banned_user(ctx, target, reason)
+    reply = f"\U0001F6AB Banned user {target}."
+    if reason:
+        reply += f" Reason: {reason}"
+    await update.message.reply_text(reply)
 
 
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    target = _resolve_target_user_id(update, ctx)
+    target, _reason = _resolve_ban_target(update, ctx)
     if not target:
         await update.message.reply_text("Usage: /unban <user_id> — or reply to their message with /unban.")
         return

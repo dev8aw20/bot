@@ -742,9 +742,74 @@ async def cb_clone_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"\U0001F4CA Stats for @{clone['bot_username']} (ID: {clone_id}) ({running})\n\n"
         f"Folders: {folders}\nBatches: {batches}\nAudios: {audios}\nUsers: {users}",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")]]
+            [
+                [InlineKeyboardButton("\U0001F465 USERS", callback_data=f"clone_users_{clone_id}")],
+                [InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")],
+            ]
         ),
     )
+
+
+CLONE_USERS_PAGE_SIZE = 30
+
+
+async def cb_clone_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """STATS -> USERS for one clone. Lists this clone's own users (their
+    Telegram user_id, and whether they're banned) — this clone's own
+    `users` table only, same clone_db resolution (own supabase or
+    fallback central db) as cb_clone_stats above."""
+    q = update.callback_query
+    parts = q.data.split("_")
+    clone_id, page = int(parts[2]), (int(parts[3]) if len(parts) > 3 else 0)
+    clone = await _get_owned_clone(update, ctx, clone_id)
+    if not clone:
+        return
+    await q.answer()
+
+    from db import Database
+    clone_db = Database(clone["supabase_url"]) if clone["supabase_url"] else ctx.application.bot_data["central_db"]
+    try:
+        if clone_db is not ctx.application.bot_data["central_db"]:
+            await clone_db.connect()
+        total = await clone_db.fetchval("SELECT COUNT(*) FROM users") or 0
+        rows = await clone_db.fetch(
+            "SELECT user_id, banned FROM users ORDER BY first_seen "
+            "LIMIT $1 OFFSET $2",
+            CLONE_USERS_PAGE_SIZE, page * CLONE_USERS_PAGE_SIZE,
+        )
+    except Exception:
+        logger.exception("Users list query failed for clone %s", clone_id)
+        await q.message.reply_text(
+            "Couldn't read users — clone's database may not be reachable.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"stats_show_{clone_id}")]]
+            ),
+        )
+        return
+    finally:
+        if clone_db is not ctx.application.bot_data["central_db"]:
+            await clone_db.disconnect()
+
+    if not rows:
+        text = "\U0001F465 No users yet."
+    else:
+        lines = [f"\U0001F465 Users ({total} total)\n"]
+        for r in rows:
+            marker = " \U0001F6AB banned" if r["banned"] else ""
+            lines.append(f"{r['user_id']}{marker}")
+        text = "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("\u2039 Prev", callback_data=f"clone_users_{clone_id}_{page - 1}"))
+    if (page + 1) * CLONE_USERS_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("Next \u203a", callback_data=f"clone_users_{clone_id}_{page + 1}"))
+    buttons = []
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("\u2039 back", callback_data=f"stats_show_{clone_id}")])
+
+    await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ── TRANSFER DB ───────────────────────────────────────────────────────────
@@ -1081,6 +1146,7 @@ def register(application: Application):
     application.add_handler(CallbackQueryHandler(cb_access_token_regen, pattern=r"^atok_regen_\d+$"))
 
     application.add_handler(CallbackQueryHandler(cb_clone_stats, pattern=r"^stats_show_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_clone_users, pattern=r"^clone_users_\d+(_\d+)?$"))
 
     application.add_handler(CallbackQueryHandler(cb_transferdb_menu, pattern=r"^tdb_menu_\d+$"))
 

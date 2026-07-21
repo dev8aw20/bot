@@ -55,6 +55,7 @@ from telegram.ext import (
     ChatJoinRequestHandler, filters, ContextTypes,
 )
 from telegram.request import HTTPXRequest
+from telegram.error import Forbidden
 
 from db import Database
 
@@ -307,16 +308,30 @@ class BotInstance:
 
         await self._continue_after_gates(update, ctx, settings, args)
 
-    def _resolve_target_user_id(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
-        """Mirrors bot.py's helper of the same purpose: `/ban 12345`, or a
-        bare `/ban` as a reply to the target's message."""
-        if ctx.args:
-            candidate = ctx.args[0].strip()
-            return candidate if candidate.isdigit() else None
+    def _resolve_ban_target(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
+        """Mirrors bot.py's helper of the same purpose: `/ban 12345 [reason]`,
+        or a reply to the target's message with `/ban [reason]`."""
         reply = update.message.reply_to_message if update.message else None
         if reply and reply.from_user:
-            return str(reply.from_user.id)
-        return None
+            reason = " ".join(ctx.args).strip() if ctx.args else None
+            return str(reply.from_user.id), (reason or None)
+        if ctx.args and ctx.args[0].strip().isdigit():
+            target = ctx.args[0].strip()
+            reason = " ".join(ctx.args[1:]).strip() if len(ctx.args) > 1 else None
+            return target, (reason or None)
+        return None, None
+
+    async def _notify_banned_user(self, ctx: ContextTypes.DEFAULT_TYPE, target: str, reason: str | None):
+        """Best-effort DM via THIS clone's own bot — never lets a failure
+        here (blocked bot, user never started this clone, etc.) undo the
+        ban itself, which already happened in the DB before this runs."""
+        text = "\U0001F6AB You have been banned from this bot."
+        if reason:
+            text += f"\n\nReason: {reason}"
+        try:
+            await ctx.bot.send_message(chat_id=int(target), text=text)
+        except Forbidden:
+            logger.warning("Clone %s: couldn't notify banned user %s — bot blocked/not started", self.clone_id, target)
 
     # ── /ban /unban — THIS clone's owner only, scoped to THIS clone's own
     # users table (self.db, not central_db) — has no effect on the master
@@ -325,20 +340,26 @@ class BotInstance:
     async def cmd_ban(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.owner_id:
             return
-        target = self._resolve_target_user_id(update, ctx)
+        target, reason = self._resolve_ban_target(update, ctx)
         if not target:
-            await update.message.reply_text("Usage: /ban <user_id> — or reply to their message with /ban.")
+            await update.message.reply_text(
+                "Usage: /ban <user_id> [reason] — or reply to their message with /ban [reason]."
+            )
             return
         if target == str(self.owner_id):
             await update.message.reply_text("Can't ban the owner.")
             return
         await self.db.ban_user(target)
-        await update.message.reply_text(f"\U0001F6AB Banned user {target}.")
+        await self._notify_banned_user(ctx, target, reason)
+        reply = f"\U0001F6AB Banned user {target}."
+        if reason:
+            reply += f" Reason: {reason}"
+        await update.message.reply_text(reply)
 
     async def cmd_unban(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.owner_id:
             return
-        target = self._resolve_target_user_id(update, ctx)
+        target, _reason = self._resolve_ban_target(update, ctx)
         if not target:
             await update.message.reply_text("Usage: /unban <user_id> — or reply to their message with /unban.")
             return
