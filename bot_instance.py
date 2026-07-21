@@ -275,6 +275,11 @@ class BotInstance:
         Settings. Force-join, broadcast, ban/unban, and everything else
         stays gated to self.owner_id directly and never calls this.
 
+        Moderator rows live in THIS clone's own db (self.db), same as
+        force_join_channels — never central_db, which only ever holds
+        this clone's registry row (bot_token, supabase_url, etc.), not
+        its moderators.
+
         The owner can never be frozen — freezing only ever applies to a
         moderator row, so the owner check below short-circuits before it.
         A frozen moderator is treated as non-staff (same as not being a
@@ -282,10 +287,11 @@ class BotInstance:
         in the moderators list so the owner can see and un-freeze them."""
         if user_id == self.owner_id:
             return True
-        mods = await self.central_db.list_moderators(self.clone_id)
-        if str(user_id) not in mods:
+        uid = str(user_id)
+        mods = await self.db.list_moderators()
+        if uid not in mods:
             return False
-        if await self.central_db.is_moderator_frozen(self.clone_id, user_id):
+        if await self.db.is_moderator_frozen(uid):
             return False
         return True
 

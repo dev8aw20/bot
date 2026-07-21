@@ -444,9 +444,19 @@ async def cb_noforward_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── MODERATORS ────────────────────────────────────────────────────────────
-async def _render_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, clone_id: int):
-    central_db = ctx.application.bot_data["central_db"]
-    mods = await central_db.list_moderators_detailed(clone_id)
+async def _render_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, clone: dict):
+    clone_id = clone["id"]
+    clone_db, owns = await _clone_db_connect(ctx, clone)
+    try:
+        mods = await clone_db.list_moderators_detailed()
+    except Exception:
+        logger.exception("Couldn't read moderators for clone %s", clone_id)
+        await update.callback_query.message.reply_text(
+            "\u26a0\ufe0f Couldn't reach this clone's database."
+        )
+        return
+    finally:
+        await _clone_db_release(clone_db, owns)
 
     rows = []
     lines = []
@@ -495,7 +505,7 @@ async def cb_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone = await _get_owned_clone(update, ctx, clone_id)
     if not clone:
         return
-    await _render_moderators_menu(update, ctx, clone_id)
+    await _render_moderators_menu(update, ctx, clone)
 
 
 async def cb_moderators_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -521,10 +531,13 @@ async def cb_moderators_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone = await _get_owned_clone(update, ctx, clone_id)
     if not clone:
         return
-    central_db = ctx.application.bot_data["central_db"]
-    await central_db.remove_moderator(clone_id, user_id)
+    clone_db, owns = await _clone_db_connect(ctx, clone)
+    try:
+        await clone_db.remove_moderator(user_id)
+    finally:
+        await _clone_db_release(clone_db, owns)
     await q.answer("Removed.")
-    await _render_moderators_menu(update, ctx, clone_id)
+    await _render_moderators_menu(update, ctx, clone)
 
 
 async def cb_moderators_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -534,7 +547,7 @@ async def cb_moderators_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not clone:
         return
     await q.answer()
-    await _render_moderators_menu(update, ctx, clone_id)
+    await _render_moderators_menu(update, ctx, clone)
 
 
 async def cb_moderators_freeze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -562,10 +575,13 @@ async def cb_moderators_unfreeze(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     clone = await _get_owned_clone(update, ctx, clone_id)
     if not clone:
         return
-    central_db = ctx.application.bot_data["central_db"]
-    await central_db.unfreeze_moderator(clone_id, user_id)
+    clone_db, owns = await _clone_db_connect(ctx, clone)
+    try:
+        await clone_db.unfreeze_moderator(user_id)
+    finally:
+        await _clone_db_release(clone_db, owns)
     await q.answer("Un-frozen.")
-    await _render_moderators_menu(update, ctx, clone_id)
+    await _render_moderators_menu(update, ctx, clone)
 
 
 def _parse_freeze_duration(text: str):
@@ -1153,7 +1169,12 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not text.isdigit():
             await update.message.reply_text("That's not a numeric Telegram user ID. Send again, or /cancel.")
             return AWAITING_INPUT
-        await central_db.add_moderator(clone_id, text)
+        clone = await central_db.get_clone(clone_id)
+        clone_db, owns = await _clone_db_connect(ctx, clone)
+        try:
+            await clone_db.add_moderator(text)
+        finally:
+            await _clone_db_release(clone_db, owns)
         await update.message.reply_text(
             f"\u2705 {text} added as moderator.",
             reply_markup=InlineKeyboardMarkup(
@@ -1174,7 +1195,12 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "\u26a0\ufe0f Send a duration like 30m, 12h, or 2d (max 30d). Or /cancel."
             )
             return AWAITING_INPUT
-        await central_db.freeze_moderator(clone_id, user_id, minutes)
+        clone = await central_db.get_clone(clone_id)
+        clone_db, owns = await _clone_db_connect(ctx, clone)
+        try:
+            await clone_db.freeze_moderator(user_id, minutes)
+        finally:
+            await _clone_db_release(clone_db, owns)
         if minutes % 1440 == 0:
             human = f"{minutes // 1440}d"
         elif minutes % 60 == 0:
