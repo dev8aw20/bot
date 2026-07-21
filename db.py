@@ -441,6 +441,16 @@ class Database:
             )
         """)
 
+        # frozen_until: NULL = not frozen. When set to a future timestamp,
+        # the moderator temporarily loses staff access (see bot_instance.py
+        # _is_staff) without being removed from the moderators list — the
+        # owner can un-freeze early, or it lapses on its own once NOW()
+        # passes it (no cron needed, every check is a live comparison).
+        await self.execute("""
+            ALTER TABLE clone_moderators
+            ADD COLUMN IF NOT EXISTS frozen_until TIMESTAMP
+        """)
+
     # ── /ban /unban helpers (master bot's OWNER_ID, or a clone owner's
     # self.owner_id — always operates on THIS Database instance's own
     # `users` table, central db for the master bot, self.db for a
@@ -527,10 +537,48 @@ class Database:
         )
         return [r["user_id"] for r in rows]
 
+    async def list_moderators_detailed(self, clone_id: int) -> list:
+        """Like list_moderators but includes frozen_until, so the dashboard
+        can show freeze status without a second query per moderator."""
+        rows = await self.fetch(
+            "SELECT user_id, frozen_until FROM clone_moderators "
+            "WHERE clone_id = $1 ORDER BY added_at",
+            clone_id,
+        )
+        return [dict(r) for r in rows]
+
     async def remove_moderator(self, clone_id: int, user_id: str):
         await self.execute(
             "DELETE FROM clone_moderators WHERE clone_id = $1 AND user_id = $2",
             clone_id, user_id,
+        )
+
+    async def freeze_moderator(self, clone_id: int, user_id: str, minutes: int):
+        """Suspend a moderator's staff access for `minutes` minutes without
+        removing them from the moderators list."""
+        await self.execute(
+            "UPDATE clone_moderators SET frozen_until = NOW() + ($3 || ' minutes')::interval "
+            "WHERE clone_id = $1 AND user_id = $2",
+            clone_id, user_id, str(minutes),
+        )
+
+    async def unfreeze_moderator(self, clone_id: int, user_id: str):
+        await self.execute(
+            "UPDATE clone_moderators SET frozen_until = NULL "
+            "WHERE clone_id = $1 AND user_id = $2",
+            clone_id, user_id,
+        )
+
+    async def is_moderator_frozen(self, clone_id: int, user_id: str) -> bool:
+        # Comparison done in SQL (frozen_until > NOW()) rather than pulling
+        # the value into Python, so this can't drift out of sync with
+        # whatever timezone the DB server's NOW() actually uses.
+        return bool(
+            await self.fetchval(
+                "SELECT frozen_until > NOW() FROM clone_moderators "
+                "WHERE clone_id = $1 AND user_id = $2",
+                clone_id, user_id,
+            )
         )
 
     # ── Clone registry helpers ───────────────────────────────────────────

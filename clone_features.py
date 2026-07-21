@@ -21,6 +21,7 @@ import logging
 import re
 import secrets
 import socket
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -443,6 +444,50 @@ async def cb_noforward_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── MODERATORS ────────────────────────────────────────────────────────────
+async def _render_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, clone_id: int):
+    central_db = ctx.application.bot_data["central_db"]
+    mods = await central_db.list_moderators_detailed(clone_id)
+
+    rows = []
+    lines = []
+    for m in mods:
+        uid = m["user_id"]
+        frozen_until = m.get("frozen_until")
+        is_frozen = bool(frozen_until and frozen_until > datetime.utcnow())
+        if is_frozen:
+            lines.append(f"\u2022 {uid} — \U0001F976 frozen until {frozen_until:%Y-%m-%d %H:%M} UTC")
+            rows.append([
+                InlineKeyboardButton(f"\U0001F976 {uid}", callback_data=f"mod_unfreeze_{clone_id}_{uid}"),
+                InlineKeyboardButton("\u274c remove", callback_data=f"mod_remove_{clone_id}_{uid}"),
+            ])
+        else:
+            lines.append(f"\u2022 {uid}")
+            rows.append([
+                InlineKeyboardButton(f"\u2744\ufe0f freeze {uid}", callback_data=f"mod_freeze_{clone_id}_{uid}"),
+                InlineKeyboardButton("\u274c remove", callback_data=f"mod_remove_{clone_id}_{uid}"),
+            ])
+    rows.append([InlineKeyboardButton("Add Moderator", callback_data=f"mod_add_{clone_id}")])
+    rows.append([InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")])
+
+    if mods:
+        text = (
+            "MODERATORS\n\n"
+            "Moderators get full access to Folders and Settings in your "
+            "clone bot — everything else (force sub, ban/unban, moderators "
+            "itself, transfer DB, etc.) stays owner-only.\n\n"
+            "\u2744\ufe0f freeze = suspend their access for a set time without "
+            "removing them. \U0001F976 tap to un-freeze early.\n\n"
+            + "\n".join(lines)
+        )
+    else:
+        text = (
+            "MODERATORS\n\n"
+            "No moderators yet. Moderators get full access to Folders and "
+            "Settings in your clone bot — everything else stays owner-only."
+        )
+    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def cb_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -450,12 +495,7 @@ async def cb_moderators_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone = await _get_owned_clone(update, ctx, clone_id)
     if not clone:
         return
-    buttons = [
-        [InlineKeyboardButton("Add Moderator", callback_data=f"mod_add_{clone_id}")],
-        [InlineKeyboardButton("View User List", callback_data=f"mod_list_{clone_id}")],
-        [InlineKeyboardButton("\u2039 back", callback_data=f"clone_dash_{clone_id}")],
-    ]
-    await q.edit_message_text("MODERATORS", reply_markup=InlineKeyboardMarkup(buttons))
+    await _render_moderators_menu(update, ctx, clone_id)
 
 
 async def cb_moderators_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -465,8 +505,26 @@ async def cb_moderators_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _get_owned_clone(update, ctx, clone_id):
         return ConversationHandler.END
     ctx.user_data["editing"] = ("add_moderator", clone_id)
-    await q.edit_message_text("Send the Telegram numeric user ID to add as moderator. /cancel to stop.")
+    await q.edit_message_text(
+        "\u26a0\ufe0f Add only a trustable person as moderator — they will "
+        "get full access to your clone's Folders and Settings (source/"
+        "output channels, custom caption, custom button, protect content).\n\n"
+        "Send the Telegram numeric user ID to add as moderator. /cancel to stop."
+    )
     return AWAITING_INPUT
+
+
+async def cb_moderators_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    clone_id, user_id = q.data.replace("mod_remove_", "").split("_", 1)
+    clone_id = int(clone_id)
+    clone = await _get_owned_clone(update, ctx, clone_id)
+    if not clone:
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.remove_moderator(clone_id, user_id)
+    await q.answer("Removed.")
+    await _render_moderators_menu(update, ctx, clone_id)
 
 
 async def cb_moderators_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -475,16 +533,54 @@ async def cb_moderators_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     clone = await _get_owned_clone(update, ctx, clone_id)
     if not clone:
         return
-    central_db = ctx.application.bot_data["central_db"]
-    mods = await central_db.list_moderators(clone_id)
     await q.answer()
-    text = "Moderators:\n" + ("\n".join(mods) if mods else "(none)")
-    await q.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("\u2039 back", callback_data=f"mod_menu_{clone_id}")]]
-        ),
+    await _render_moderators_menu(update, ctx, clone_id)
+
+
+async def cb_moderators_freeze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point: owner tapped "freeze {uid}" — ask for how long."""
+    q = update.callback_query
+    await q.answer()
+    clone_id, user_id = q.data.replace("mod_freeze_", "").split("_", 1)
+    clone_id = int(clone_id)
+    if not await _get_owned_clone(update, ctx, clone_id):
+        return ConversationHandler.END
+    ctx.user_data["editing"] = ("freeze_moderator_minutes", clone_id)
+    ctx.user_data["freeze_target_uid"] = user_id
+    await q.edit_message_text(
+        f"\u2744\ufe0f Freeze moderator {user_id} for how long?\n\n"
+        "Send a duration like 30m, 12h, 2d, or just a number of minutes. "
+        "/cancel to stop."
     )
+    return AWAITING_INPUT
+
+
+async def cb_moderators_unfreeze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    clone_id, user_id = q.data.replace("mod_unfreeze_", "").split("_", 1)
+    clone_id = int(clone_id)
+    clone = await _get_owned_clone(update, ctx, clone_id)
+    if not clone:
+        return
+    central_db = ctx.application.bot_data["central_db"]
+    await central_db.unfreeze_moderator(clone_id, user_id)
+    await q.answer("Un-frozen.")
+    await _render_moderators_menu(update, ctx, clone_id)
+
+
+def _parse_freeze_duration(text: str):
+    """Accepts '30', '30m', '12h', '2d' (case-insensitive). Returns minutes
+    as an int, or None if unparsable / out of range. Capped at 30 days so a
+    typo can't lock a moderator out indefinitely."""
+    text = text.strip().lower()
+    match = re.fullmatch(r"(\d+)\s*(m|h|d)?", text)
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2) or "m"
+    minutes = value * {"m": 1, "h": 60, "d": 1440}[unit]
+    if minutes <= 0 or minutes > 30 * 1440:
+        return None
+    return minutes
 
 
 # ── AUTO DELETE ───────────────────────────────────────────────────────────
@@ -1067,6 +1163,34 @@ async def receive_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("editing", None)
         return ConversationHandler.END
 
+    if field == "freeze_moderator_minutes":
+        user_id = ctx.user_data.get("freeze_target_uid")
+        if not user_id:
+            ctx.user_data.pop("editing", None)
+            return ConversationHandler.END
+        minutes = _parse_freeze_duration(text)
+        if minutes is None:
+            await update.message.reply_text(
+                "\u26a0\ufe0f Send a duration like 30m, 12h, or 2d (max 30d). Or /cancel."
+            )
+            return AWAITING_INPUT
+        await central_db.freeze_moderator(clone_id, user_id, minutes)
+        if minutes % 1440 == 0:
+            human = f"{minutes // 1440}d"
+        elif minutes % 60 == 0:
+            human = f"{minutes // 60}h"
+        else:
+            human = f"{minutes}m"
+        await update.message.reply_text(
+            f"\u2744\ufe0f {user_id} frozen for {human}.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2039 back", callback_data=f"mod_menu_{clone_id}")]]
+            ),
+        )
+        ctx.user_data.pop("editing", None)
+        ctx.user_data.pop("freeze_target_uid", None)
+        return ConversationHandler.END
+
     if field == "auto_delete_minutes_custom":
         if not text.isdigit() or not (1 <= int(text) <= 1440):
             await update.message.reply_text(
@@ -1133,6 +1257,8 @@ def register(application: Application):
 
     application.add_handler(CallbackQueryHandler(cb_moderators_menu, pattern=r"^mod_menu_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_moderators_list, pattern=r"^mod_list_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_moderators_remove, pattern=r"^mod_remove_\d+_\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_moderators_unfreeze, pattern=r"^mod_unfreeze_\d+_\d+$"))
 
     application.add_handler(CallbackQueryHandler(cb_autodelete_menu, pattern=r"^ad_menu_\d+$"))
     application.add_handler(CallbackQueryHandler(cb_autodelete_toggle, pattern=r"^ad_toggle_\d+$"))
@@ -1160,6 +1286,7 @@ def register(application: Application):
             CallbackQueryHandler(cb_custombutton_add, pattern=r"^cbtn_add_\d+$"),
             CallbackQueryHandler(cb_forcesub_add, pattern=r"^fsub_add_\d+$"),
             CallbackQueryHandler(cb_moderators_add, pattern=r"^mod_add_\d+$"),
+            CallbackQueryHandler(cb_moderators_freeze, pattern=r"^mod_freeze_\d+_\d+$"),
             CallbackQueryHandler(cb_autodelete_msg_edit, pattern=r"^ad_msg_edit_\d+$"),
             CallbackQueryHandler(cb_autodelete_time_custom, pattern=r"^ad_time_custom_\d+$"),
             CallbackQueryHandler(cb_transferdb_start, pattern=r"^tdb_start_\d+$"),
