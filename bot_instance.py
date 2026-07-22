@@ -101,8 +101,14 @@ def set_master_bot_username(username: str) -> None:
 EPISODE_EXTRACT_PATTERNS = [
     re.compile(r'(?:episode|ep)\.?\s*#?\s*(\d+)', re.IGNORECASE),
     re.compile(r'#\s*(\d+)'),
-    re.compile(r'(\d+)'),
 ]
+# NOTE: a bare r'(\d+)' tier used to sit here as a last resort. Removed —
+# it matched the FIRST number anywhere in the filename/title (bitrate,
+# year, track number, quality tag, whatever came first), not necessarily
+# the real episode number. Two unrelated files could extract the same
+# digit and get wrongly flagged as duplicates. Anything without
+# "episode"/"ep"/"#N" now correctly falls through to
+# _fallback_name_identifier() below, same as a song with no number in it.
 
 # Same two env vars master_menu.py reads for its own ABOUT page — reused
 # here verbatim so the clone's ABOUT shows the same platform support/about
@@ -1255,17 +1261,42 @@ class BotInstance:
         channel_id = folder["channel_id"]
 
         dup = await self.db.fetchrow(
-            """SELECT a.id FROM audios a
+            """SELECT a.id, a.telegram_file_id, a.message_id FROM audios a
                JOIN batches b ON b.id = a.batch_id
                WHERE b.folder_id = $1 AND a.episode_no = $2""",
             folder_id, episode_no
         )
         if dup:
-            logger.info(
-                "Episode %s already ingested for folder %s (message %s) — skipping duplicate.",
-                episode_no, folder_id, message_id,
+            # Same episode_no AND same file/message = genuine duplicate
+            # (e.g. Telegram retry, or the same post re-forwarded).
+            if dup["telegram_file_id"] == telegram_file_id or dup["message_id"] == message_id:
+                logger.info(
+                    "Episode %s already ingested for folder %s (message %s) — skipping duplicate.",
+                    episode_no, folder_id, message_id,
+                )
+                return
+            # Same episode_no but a DIFFERENT file/message: the number
+            # extraction collided (bad caption/filename), not a real
+            # re-upload. Don't silently drop it — alert the owner and
+            # ingest anyway so the file isn't lost.
+            logger.warning(
+                "Episode_no %s collides with existing audio id=%s in folder %s, "
+                "but file_id/message_id differ (new message %s) — treating as a "
+                "NEW file with a bad/duplicate episode number, not a duplicate.",
+                episode_no, dup["id"], folder_id, message_id,
             )
-            return
+            try:
+                await ctx.bot.send_message(
+                    chat_id=self.owner_id,
+                    text=(
+                        f"\u26a0\ufe0f New audio in \"{folder['name']}\" (message {message_id}) "
+                        f"extracted episode number {episode_no}, which is already used by "
+                        f"another audio in this folder. It was ingested anyway (not dropped) "
+                        f"— please check the filename/caption and fix the episode number if needed."
+                    )
+                )
+            except Exception:
+                pass
 
         # Attach the new row to whichever batch is currently last — this
         # is just a holding spot. rebalance_folder_batches() below
