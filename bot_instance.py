@@ -18,7 +18,9 @@ previously never happened). All gated on self.owner_id, i.e. THIS clone's
 own owner, not the master bot's admin.
 
 STILL NOT PORTED, so don't be surprised by these:
-  - broadcast, episode search (non-owner text fallthrough), /refreshbuttons.
+  - broadcast, /refreshbuttons.
+  (episode search / non-owner text fallthrough was removed from bot.py
+  entirely, so there's nothing left to port for it.)
 
 Porting each of those is the same mechanical transform repeated per
 remaining group:
@@ -250,6 +252,18 @@ class BotInstance:
         # folder id=1 don't share a lock.
         self._folder_ingest_locks: dict[int, asyncio.Lock] = {}
 
+    async def _can_manage(self, user_id: int) -> bool:
+        """True for THIS clone's owner, or for a user added as a moderator
+        for THIS clone via the master bot's Customize Clone -> MODERATORS ->
+        Add Moderator flow (clone_features.py writes that user_id into
+        clone_moderators on the CENTRAL db; central_db.is_moderator reads
+        it back here). Scope: Folders + Settings only -- moderators are
+        deliberately NOT let through the /ban, /unban, or /forcejoin gates,
+        which stay owner_id-only everywhere else in this file."""
+        if user_id == self.owner_id:
+            return True
+        return await self.central_db.is_moderator(self.clone_id, user_id)
+
     def _reset_owner_state(self):
         self.awaiting_new_folder_name = False
         self.awaiting_channel_id_for_folder = None
@@ -475,19 +489,24 @@ class BotInstance:
         )
         await query.edit_message_text(text, reply_markup=self._start_menu_markup())
 
-    # ── SETTINGS (owner-only, THIS clone's own clone_settings row) ───────
+    # ── SETTINGS (owner + moderators, THIS clone's own clone_settings
+    # row) ─────────────────────────────────────────────────────────────
     # The clone-owner-facing equivalent of master_menu.py's Settings menu.
     # That one edits the master bot's singleton bot_settings row and is
     # gated to the MASTER bot's OWNER_ID — it must never be reachable from
     # here. This one edits clone_settings WHERE clone_id = self.clone_id
-    # and is gated to self.owner_id, THIS clone's own owner. Mirrors the
-    # UI/UX of master_menu.py's screen but scoped per-clone, and uses the
-    # same handle_owner_text single-flag pattern as the folder/forcejoin
-    # flows above (no ConversationHandler — see module docstring).
+    # and is gated via self._can_manage: self.owner_id, THIS clone's own
+    # owner, OR anyone whose user_id was added as a moderator for this
+    # clone via the master bot's Customize Clone dashboard (stored in
+    # clone_moderators on the CENTRAL db). Mirrors the UI/UX of
+    # master_menu.py's screen but scoped per-clone, and uses the same
+    # handle_owner_text single-flag pattern as the folder flows above (no
+    # ConversationHandler — see module docstring and handle_owner_text's
+    # caveat about shared wizard state).
     async def cb_settings_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
-            await q.answer("\u26d4 Only the bot owner can use Settings.", show_alert=True)
+        if not await self._can_manage(q.from_user.id):
+            await q.answer("\u26d4 Only the bot owner or a moderator can use Settings.", show_alert=True)
             return
         await q.answer()
         settings = await self.central_db.get_clone_settings(self.clone_id)
@@ -508,7 +527,7 @@ class BotInstance:
 
     async def cb_settings_protect_toggle(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         settings = await self.central_db.get_clone_settings(self.clone_id)
@@ -519,7 +538,7 @@ class BotInstance:
 
     async def cb_settings_caption_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -541,7 +560,7 @@ class BotInstance:
 
     async def cb_settings_caption_edit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -553,7 +572,7 @@ class BotInstance:
 
     async def cb_settings_caption_see(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -568,7 +587,7 @@ class BotInstance:
 
     async def cb_settings_caption_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await self.central_db.update_clone_settings(self.clone_id, custom_caption=None)
@@ -577,7 +596,7 @@ class BotInstance:
 
     async def cb_settings_button_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -594,7 +613,7 @@ class BotInstance:
 
     async def cb_settings_button_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await q.answer()
@@ -607,7 +626,7 @@ class BotInstance:
 
     async def cb_settings_button_delete(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             await q.answer("Not allowed.", show_alert=True)
             return
         await self.central_db.update_clone_settings(self.clone_id, custom_buttons=None)
@@ -1008,12 +1027,13 @@ class BotInstance:
     # ── /folders group (converted from bot.py's cmd_folders and everything
     # it fans out to: detail view, output/source channel setting with live
     # Telegram verification, and the text-wizard those trigger). All of it
-    # is gated on self.owner_id, which is THIS clone's owner (from
-    # clone_row["user_id"]), not the master bot's admin — so each clone
-    # owner already gets independent access to their own folders, they
-    # were just missing everything past folder creation. ────────────────
+    # is gated via self._can_manage: self.owner_id (THIS clone's owner,
+    # from clone_row["user_id"], not the master bot's admin) OR a
+    # moderator added for this clone — so each clone owner already gets
+    # independent access to their own folders, and can now delegate that
+    # same access to trusted moderators via Customize Clone. ────────────
     async def cmd_folders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != self.owner_id:
+        if not await self._can_manage(update.effective_user.id):
             return
         await self._show_folder_management(update, ctx)
 
@@ -1047,7 +1067,7 @@ class BotInstance:
     async def cb_folder_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         self._reset_owner_state()
         self.awaiting_new_folder_name = True
@@ -1056,7 +1076,7 @@ class BotInstance:
     async def cb_folder_manage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_manage_", ""))
         folder = await self.db.fetchrow(
@@ -1085,7 +1105,7 @@ class BotInstance:
     async def cb_folder_rename(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_rename_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1102,7 +1122,7 @@ class BotInstance:
         records too (delete_folder_cascade), not just the folder row."""
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_delete_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1122,7 +1142,7 @@ class BotInstance:
 
     async def cb_folder_delete_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_delete_yes_", ""))
         folder = await self.db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
@@ -1142,14 +1162,14 @@ class BotInstance:
     async def cb_folder_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         await self._show_folder_management(update, ctx)
 
     async def cb_folder_setchannel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_setchannel_", ""))
         self._reset_owner_state()
@@ -1162,7 +1182,7 @@ class BotInstance:
     async def cb_folder_setsource(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        if q.from_user.id != self.owner_id:
+        if not await self._can_manage(q.from_user.id):
             return
         folder_id = int(q.data.replace("folder_setsource_", ""))
         self._reset_owner_state()
@@ -1490,13 +1510,40 @@ class BotInstance:
                 folder_id, page_index, str(msg.message_id)
             )
 
-    # ── text-wizard state machine for the folder flows above (converted
-    # from the folder-related branches of bot.py's handle_links). Scoped
-    # to self.owner_id only — non-owner text (episode search / public
-    # link intake) is NOT ported here yet, so non-owner messages are
-    # ignored rather than silently mishandled. ──────────────────────────
+    # ── text-wizard state machine for the folder + settings flows above
+    # (converted from the folder-related branches of bot.py's
+    # handle_links). Scoped to self.owner_id OR a moderator (see
+    # _can_manage) — non-owner/non-moderator text (episode search or
+    # public link intake) is NOT ported here yet, so those messages are
+    # ignored rather than silently mishandled.
+    #
+    # CAVEAT: the awaiting_* flags below are single per-clone-instance
+    # attributes, not per-user state (there's no ConversationHandler —
+    # see the module docstring). That was safe when only the owner could
+    # ever be mid-wizard. Now that moderators share this same text
+    # handler, if the owner and a moderator are BOTH mid-wizard at the
+    # same time, whoever's message arrives second can overwrite the
+    # other's pending step. Low-probability, but real — a proper fix
+    # needs per-user wizard state, which is a larger refactor than this
+    # gate change. The /forcejoin wizard stays reachable via its own
+    # awaiting_force_join_* flags too, but is deliberately kept
+    # owner-only below since forcejoin entry points (cb_forcejoin_add
+    # etc.) never let a moderator set those flags in the first place —
+    # this just stops a moderator's stray message from being consumed by
+    # (and corrupting) an owner's in-progress forcejoin wizard. ────────
     async def handle_owner_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != self.owner_id:
+        user_id = update.effective_user.id
+        if not await self._can_manage(user_id):
+            return
+        is_owner = user_id == self.owner_id
+        forcejoin_wizard_active = (
+            self.awaiting_force_join_edit_channel_id is not None
+            or self.awaiting_force_join_step is not None
+        )
+        if forcejoin_wizard_active and not is_owner:
+            # A moderator's message landed while the owner has a
+            # forcejoin wizard pending — ignore it rather than let it be
+            # consumed as (or clobber) the owner's forcejoin step.
             return
         text = (update.message.text or "").strip()
 

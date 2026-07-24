@@ -129,10 +129,14 @@ force_join_pending_title: str | None = None
 # already-existing channel_id (set when owner taps "✏️ Edit Link").
 awaiting_force_join_edit_channel_id: str | None = None
 
-# Broadcast flow: owner's fallback text (no other active state) is held here
-# until they confirm via inline button — NOT sent immediately, so a stray
-# typo with no active session can't blast every user.
-pending_broadcast_text: str | None = None
+# Broadcast flow: owner's fallback text (no other active state), or the
+# media they sent after /broadcast, is held here until they confirm via
+# inline button — NOT sent immediately, so a stray typo/upload with no
+# active session can't blast every user.
+# Shape: {"kind": "text", "text": str}
+#     or {"kind": "photo"|"video"|"audio"|"document"|"voice"|"animation"|"sticker",
+#         "file_id": str, "caption": str | None}
+pending_broadcast: dict | None = None
 
 
 def _reset_owner_state():
@@ -140,7 +144,7 @@ def _reset_owner_state():
     global awaiting_source_channel_id_for_folder, new_folder_pending_source
     global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
     global awaiting_force_join_edit_channel_id
-    global pending_broadcast_text
+    global pending_broadcast
     global awaiting_rename_folder_id
     awaiting_new_folder_name = False
     awaiting_channel_id_for_folder = None
@@ -151,7 +155,7 @@ def _reset_owner_state():
     force_join_pending_channel_id = None
     force_join_pending_title = None
     awaiting_force_join_edit_channel_id = None
-    pending_broadcast_text = None
+    pending_broadcast = None
 
 
 # ── /folders ──────────────────────────────────────────────────────────────────
@@ -560,58 +564,8 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
 
 # ── Text message handler ──────────────────────────────────────────────────────
-EPISODE_SEARCH_RE = re.compile(r'\d+')
-
-
-async def _handle_episode_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Non-owner text handler: treats the message as an episode-number query
-    and sends back the matching audio(s) straight from their cached
-    telegram_file_id — no download, no batch delivery."""
-    text = (update.message.text or "").strip()
-    m = EPISODE_SEARCH_RE.search(text)
-    if not m:
-        await update.message.reply_text("🔎 Send just the episode number to search (e.g. 12).")
-        return
-
-    await db.execute(
-        """INSERT INTO users (user_id) VALUES ($1)
-           ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW()""",
-        str(update.effective_user.id)
-    )
-
-    if not await _check_force_join(update, ctx, None):
-        return
-
-    episode_no = str(int(m.group()))  # normalize away leading zeros
-    rows = await db.fetch(
-        "SELECT telegram_file_id, file_name, file_size, caption FROM audios "
-        "WHERE episode_no = $1 AND telegram_file_id IS NOT NULL",
-        episode_no
-    )
-    if not rows:
-        await update.message.reply_text(f"❌ Episode {episode_no} not found.")
-        return
-
-    settings = await db.get_bot_settings()
-    custom_markup = _parse_custom_buttons(settings["custom_buttons"])
-
-    for row in rows:
-        try:
-            await ctx.bot.send_audio(
-                chat_id=update.effective_chat.id,
-                audio=row["telegram_file_id"],
-                caption=_render_caption(settings["custom_caption"], row),
-                protect_content=settings["protect_content"],
-                reply_markup=custom_markup,
-            )
-        except Exception as e:
-            logger.error(f"Episode search send failed for episode {episode_no}: {e}")
-            await update.message.reply_text("⚠️ Could not send this audio right now, please try again.")
-
-
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await _handle_episode_search(update, ctx)
         return
 
     text = (update.message.text or "").strip()
@@ -868,17 +822,16 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Send a text message for the broadcast.")
         return
 
-    global pending_broadcast_text
-    pending_broadcast_text = text
+    global pending_broadcast
     recipient_count = await db.fetchval(
         "SELECT COUNT(*) FROM users WHERE user_id != $1", str(OWNER_ID)
     )
 
     if not recipient_count:
-        pending_broadcast_text = None
         await update.message.reply_text("ℹ️ There are no users to broadcast to.")
         return
 
+    pending_broadcast = {"kind": "text", "text": text}
     rows = [[
         InlineKeyboardButton("✅ Confirm Broadcast", callback_data="broadcast_confirm"),
         InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel"),
@@ -1052,82 +1005,57 @@ async def broadcast(update, context):
 
 
 async def handle_broadcast(update, context):
-    global BROADCAST_MODE
+    """Owner sent media while BROADCAST_MODE is on. Doesn't send anything
+    yet — captures it into the same pending_broadcast confirm flow the
+    text path uses, so media broadcasts get the identical recipient-count
+    preview and Confirm/Cancel gate before anything goes out."""
+    global BROADCAST_MODE, pending_broadcast
 
     if not BROADCAST_MODE:
         return
 
-    users = await db.fetch("SELECT DISTINCT user_id FROM sent_logs")
+    msg = update.message
+    caption = msg.caption
 
-    success = 0
-    failed = 0
-
-    for user in users:
-        uid = int(user["user_id"])
-
-        try:
-            if update.message.text:
-                await context.bot.send_message(uid, update.message.text)
-
-            elif update.message.photo:
-                await context.bot.send_photo(
-                    uid,
-                    update.message.photo[-1].file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.video:
-                await context.bot.send_video(
-                    uid,
-                    update.message.video.file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.audio:
-                await context.bot.send_audio(
-                    uid,
-                    update.message.audio.file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.document:
-                await context.bot.send_document(
-                    uid,
-                    update.message.document.file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.voice:
-                await context.bot.send_voice(
-                    uid,
-                    update.message.voice.file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.animation:
-                await context.bot.send_animation(
-                    uid,
-                    update.message.animation.file_id,
-                    caption=update.message.caption
-                )
-
-            elif update.message.sticker:
-                await context.bot.send_sticker(
-                    uid,
-                    update.message.sticker.file_id
-                )
-
-            success += 1
-
-        except:
-            failed += 1
+    if msg.photo:
+        kind, file_id = "photo", msg.photo[-1].file_id
+    elif msg.video:
+        kind, file_id = "video", msg.video.file_id
+    elif msg.audio:
+        kind, file_id = "audio", msg.audio.file_id
+    elif msg.document:
+        kind, file_id = "document", msg.document.file_id
+    elif msg.voice:
+        kind, file_id = "voice", msg.voice.file_id
+    elif msg.animation:
+        kind, file_id = "animation", msg.animation.file_id
+    elif msg.sticker:
+        kind, file_id = "sticker", msg.sticker.file_id
+        caption = None  # stickers can't carry a caption
+    else:
+        return
 
     BROADCAST_MODE = False
 
-    await update.message.reply_text(
-        f"✅ Broadcast complete.\n"
-        f"Success: {success}\n"
-        f"Failed: {failed}"
+    recipient_count = await db.fetchval(
+        "SELECT COUNT(*) FROM users WHERE user_id != $1", str(OWNER_ID)
+    )
+    if not recipient_count:
+        await msg.reply_text("ℹ️ There are no users to broadcast to.")
+        return
+
+    pending_broadcast = {"kind": kind, "file_id": file_id, "caption": caption}
+    rows = [[
+        InlineKeyboardButton("✅ Confirm Broadcast", callback_data="broadcast_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel"),
+    ]]
+    label = caption or "(no caption)"
+    await msg.reply_text(
+        f"📢 Send this {kind} to *{recipient_count} user(s)*?\n\n"
+        f"—\n{label}\n—\n\n"
+        f"⚠️ This action cannot be undone.",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode="Markdown"
     )
 
 
@@ -1741,20 +1669,31 @@ async def exit_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_broadcast_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    global pending_broadcast_text
-    pending_broadcast_text = None
+    global pending_broadcast
+    pending_broadcast = None
     await update.callback_query.edit_message_text("❌ Broadcast cancelled.")
+
+
+_BROADCAST_SENDERS = {
+    "photo": lambda bot, chat_id, b: bot.send_photo(chat_id, b["file_id"], caption=b["caption"]),
+    "video": lambda bot, chat_id, b: bot.send_video(chat_id, b["file_id"], caption=b["caption"]),
+    "audio": lambda bot, chat_id, b: bot.send_audio(chat_id, b["file_id"], caption=b["caption"]),
+    "document": lambda bot, chat_id, b: bot.send_document(chat_id, b["file_id"], caption=b["caption"]),
+    "voice": lambda bot, chat_id, b: bot.send_voice(chat_id, b["file_id"], caption=b["caption"]),
+    "animation": lambda bot, chat_id, b: bot.send_animation(chat_id, b["file_id"], caption=b["caption"]),
+    "sticker": lambda bot, chat_id, b: bot.send_sticker(chat_id, b["file_id"]),
+}
 
 
 async def cb_broadcast_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    global pending_broadcast_text
-    text = pending_broadcast_text
-    pending_broadcast_text = None
+    global pending_broadcast
+    broadcast = pending_broadcast
+    pending_broadcast = None
 
-    if not text:
-        await update.callback_query.edit_message_text("⚠️ Broadcast text not found — please try again.")
+    if not broadcast:
+        await update.callback_query.edit_message_text("⚠️ Broadcast content not found — please try again.")
         return
 
     await update.callback_query.edit_message_text("⏳ Sending broadcast...")
@@ -1765,7 +1704,10 @@ async def cb_broadcast_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for row in rows:
         uid = row["user_id"]
         try:
-            await ctx.bot.send_message(chat_id=int(uid), text=text)
+            if broadcast["kind"] == "text":
+                await ctx.bot.send_message(chat_id=int(uid), text=broadcast["text"])
+            else:
+                await _BROADCAST_SENDERS[broadcast["kind"]](ctx.bot, int(uid), broadcast)
             sent += 1
         except Forbidden:
             # User blocked the bot or deleted their account — remove them

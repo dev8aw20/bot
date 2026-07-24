@@ -527,6 +527,17 @@ class Database:
         )
         return [r["user_id"] for r in rows]
 
+    async def is_moderator(self, clone_id: int, user_id) -> bool:
+        """Single-row existence check — used by the running clone process
+        on every Folders/Settings gate, so this stays a cheap indexed
+        lookup (clone_moderators' PK is (clone_id, user_id)) rather than
+        pulling the whole list via list_moderators just to test membership."""
+        row = await self.fetchval(
+            "SELECT 1 FROM clone_moderators WHERE clone_id = $1 AND user_id = $2",
+            clone_id, str(user_id),
+        )
+        return row is not None
+
     async def remove_moderator(self, clone_id: int, user_id: str):
         await self.execute(
             "DELETE FROM clone_moderators WHERE clone_id = $1 AND user_id = $2",
